@@ -1,0 +1,29 @@
+{
+  "name": "@ironin/pi-cascading-skills",
+  "version": "1.0.0",
+  "description": "Walks parent directories to collect skills from every .pi/ level, solving pi's array-replacement behavior for skills.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/cascading-skills.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/cascading-skills.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "skills"
+  ],
+  "peerDependencies": {
+    "@sinclair/typebox": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
