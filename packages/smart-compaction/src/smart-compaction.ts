@@ -46,6 +46,7 @@ import type {
 import { convertToLlm, serializeConversation, SessionManager } from "@mariozechner/pi-coding-agent";
 import { complete } from "@mariozechner/pi-ai";
 import { mkdir, writeFile, readdir, readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { scoreAllMessages, scoreAllMessagesSync, classify } from "./scorer.js";
@@ -62,6 +63,8 @@ interface SmartCompactionSettings {
   summarizeHigh: boolean;
   summarizeLow: boolean;
   skipUnderMessages: number;
+  scoringProvider: string;  // e.g. "openrouter", "google", "anthropic"
+  scoringModel: string;      // e.g. "google/gemini-2.5-flash-lite"
 }
 
 const DEFAULT_SETTINGS: SmartCompactionSettings = {
@@ -71,15 +74,47 @@ const DEFAULT_SETTINGS: SmartCompactionSettings = {
   summarizeHigh: true,
   summarizeLow: true,
   skipUnderMessages: 6,
+  scoringProvider: "openrouter",
+  scoringModel: "google/gemini-2.5-flash-lite",
 };
 
+function readSettingsJson(): Partial<SmartCompactionSettings> {
+  try {
+    const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
+    const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    const sc = raw.smartCompaction as Record<string, unknown> | undefined;
+    if (!sc) return {};
+    const out: Partial<SmartCompactionSettings> = {};
+    if (typeof sc.keepThreshold === "number") out.keepThreshold = sc.keepThreshold as number;
+    if (typeof sc.dropThreshold === "number") out.dropThreshold = sc.dropThreshold as number;
+    if (typeof sc.retryWindow === "number") out.retryWindow = sc.retryWindow as number;
+    if (typeof sc.summarizeHigh === "boolean") out.summarizeHigh = sc.summarizeHigh as boolean;
+    if (typeof sc.summarizeLow === "boolean") out.summarizeLow = sc.summarizeLow as boolean;
+    if (typeof sc.skipUnderMessages === "number") out.skipUnderMessages = sc.skipUnderMessages as number;
+    if (typeof sc.scoringProvider === "string") out.scoringProvider = sc.scoringProvider as string;
+    if (typeof sc.scoringModel === "string") out.scoringModel = sc.scoringModel as string;
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 function loadSettings(): SmartCompactionSettings {
+  // Layer 1: hardcoded defaults
   const s = { ...DEFAULT_SETTINGS };
+  // Layer 2: ~/.pi/agent/settings.json → smartCompaction
+  const file = readSettingsJson();
+  Object.assign(s, file);
+  // Layer 3: env vars override everything
   const envKeep = process.env.PI_SMART_COMPACT_KEEP;
   const envDrop = process.env.PI_SMART_COMPACT_DROP;
   if (envKeep) s.keepThreshold = clamp(parseInt(envKeep, 10), 4, 10);
   if (envDrop) s.dropThreshold = clamp(parseInt(envDrop, 10), 0, s.keepThreshold - 1);
   if (s.dropThreshold >= s.keepThreshold) s.dropThreshold = s.keepThreshold - 1;
+  const envProvider = process.env.PI_SMART_COMPACT_SCORING_PROVIDER;
+  const envModel = process.env.PI_SMART_COMPACT_SCORING_MODEL;
+  if (envProvider) s.scoringProvider = envProvider;
+  if (envModel) s.scoringModel = envModel;
   return s;
 }
 
@@ -383,7 +418,12 @@ async function handleSmartCompaction(
     settings.keepThreshold,
     settings.dropThreshold,
     settings.retryWindow,
-    { modelRegistry: ctx.modelRegistry, signal },
+    {
+      modelRegistry: ctx.modelRegistry,
+      signal,
+      providerId: settings.scoringProvider,
+      modelId: settings.scoringModel,
+    },
   );
   const scoringMethod = scored[0]?.method ?? "heuristic";
 
@@ -441,7 +481,9 @@ async function handleSmartCompaction(
     scoringMethod,
   };
 
-  const scoringTag = scoringMethod === "llm" ? " [llm-scored]" : "";
+  const scoringTag = scoringMethod === "llm"
+    ? ` [${settings.scoringProvider}:${settings.scoringModel}]`
+    : " [heuristic]";
   ctx.ui.notify(
     `Smart compaction: ${flatMsgs.length} turns → ${highCount} HIGH + ${mediumCount} MEDIUM + ${lowCount} LOW | ~${(tokensSaved / 1000).toFixed(1)}K saved${scoringTag}`,
     "info",
@@ -487,7 +529,7 @@ interface CompactionSnapshot {
   version: 1;
   timestamp: string;
   sessionFile: string;
-  settings: { keepThreshold: number; dropThreshold: number; summarizeHigh: boolean; summarizeLow: boolean };
+  settings: { keepThreshold: number; dropThreshold: number; summarizeHigh: boolean; summarizeLow: boolean; scoringProvider: string; scoringModel: string };
   preCompaction: { messageCount: number; tokensBefore: number; isSplitTurn: boolean; turnPrefixCount: number };
   messages: Array<{
     role: string; content: string; contentLength: number; score: number;
@@ -517,6 +559,7 @@ function buildCompactionSnapshot(data: {
     settings: {
       keepThreshold: data.settings.keepThreshold, dropThreshold: data.settings.dropThreshold,
       summarizeHigh: data.settings.summarizeHigh, summarizeLow: data.settings.summarizeLow,
+      scoringProvider: data.settings.scoringProvider, scoringModel: data.settings.scoringModel,
     },
     preCompaction: data.preCompaction, messages: data.messages,
     postCompaction: data.postCompaction, stats: data.stats, retryLoops: data.retryLoops,
@@ -684,7 +727,7 @@ function formatAnalysisOutput(result: AnalysisResult, sessionName: string, setti
     `╚════════════════════════════════════════════════════════╝`,
     ``,
     `Session: ${sessionName}`,
-    `Settings: keep≥${settings.keepThreshold} drop<${settings.dropThreshold} | summarizeHigh=${settings.summarizeHigh} summarizeLow=${settings.summarizeLow}`,
+    `Settings: keep≥${settings.keepThreshold} drop<${settings.dropThreshold} | scorer=${settings.scoringProvider}:${settings.scoringModel} | summarizeHigh=${settings.summarizeHigh} summarizeLow=${settings.summarizeLow}`,
     ``,
     `── Overview ──`,
     `Messages analyzed: ${result.stats.totalTurns}`,
@@ -852,7 +895,7 @@ async function cmdTune(ctx: any, snapshots: CompactionSnapshot[], args: string) 
 
   const lines = [
     `**Tuning: Compaction #${idx + 1}** (${new Date(sn.timestamp).toLocaleString()})`,
-    `Settings: keep≥${sn.settings.keepThreshold} drop<${sn.settings.dropThreshold}`,
+    `Settings: keep≥${sn.settings.keepThreshold} drop<${sn.settings.dropThreshold} | scorer=${sn.settings.scoringProvider || "heuristic"}:${sn.settings.scoringModel || "—"}`,
     `Messages: ${sn.stats.totalTurns} | Saved: ~${(sn.postCompaction.tokensSaved / 1000).toFixed(1)}K`,
     "",
     `**Score Distribution:**`,
@@ -972,14 +1015,14 @@ export default function (pi: ExtensionAPI) {
 
   // Intercepts ALL compaction: auto-trigger + /compact
   pi.on("session_before_compact", async (event, ctx) => {
-    ctx.ui.setStatus("smart-compaction", `smart: keep≥${settings.keepThreshold}`);
+    ctx.ui.setStatus("smart-compaction", `smart: ${settings.scoringModel} keep≥${settings.keepThreshold}`);
     const result = await handleSmartCompaction(event, ctx, settings);
     ctx.ui.setStatus("smart-compaction", undefined);
     return result;
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("smart-compaction", `smart: keep≥${settings.keepThreshold}`);
+    ctx.ui.setStatus("smart-compaction", `smart: ${settings.scoringModel} keep≥${settings.keepThreshold}`);
 
     // Handle --smart-compress flag
     const flagValue = pi.getFlag("smart-compress") as string | undefined;
@@ -1066,7 +1109,7 @@ export default function (pi: ExtensionAPI) {
             `**Smart Compaction Status**`,
             "",
             `Current context: ~${currentTokens}`,
-            `Settings: keep≥${settings.keepThreshold} drop<${settings.dropThreshold}`,
+            `Settings: keep≥${settings.keepThreshold} drop<${settings.dropThreshold} | scorer=${settings.scoringProvider}:${settings.scoringModel}`,
             `Recorded compactions: ${snapshots.length}`,
             "",
             `**Subcommands:**`,

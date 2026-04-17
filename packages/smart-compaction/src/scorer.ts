@@ -34,20 +34,13 @@ export async function scoreMessagesLlm(
   opts: {
     modelRegistry: any;
     signal?: AbortSignal;
-    modelId?: string;     // e.g. "gemini-2.5-flash"
-    providerId?: string;  // e.g. "google"
+    providerId: string;   // e.g. "openrouter"
+    modelId: string;      // e.g. "google/gemini-2.5-flash-lite"
   },
 ): Promise<number[] | null> {
   if (messages.length === 0) return [];
 
-  const modelId = opts.modelId ?? "gemini-2.5-flash";
-  const providerId = opts.providerId ?? "google";
-
-  const model =
-    opts.modelRegistry.find(providerId, modelId) ??
-    opts.modelRegistry.find("google", "gemini-2.5-flash") ??
-    opts.modelRegistry.find("openai", "gpt-4o-mini") ??
-    opts.modelRegistry.find("anthropic", "claude-sonnet-4-20250514");
+  const model = opts.modelRegistry.find(opts.providerId, opts.modelId);
 
   if (!model) return null;
 
@@ -391,6 +384,8 @@ export async function scoreAllMessages(
   llmOpts?: {
     modelRegistry: any;
     signal?: AbortSignal;
+    providerId: string;
+    modelId: string;
   },
 ): Promise<Array<{ score: number; classification: "HIGH" | "MEDIUM" | "LOW"; method: "llm" | "heuristic" }>> {
   let scores: number[] | null = null;
@@ -401,6 +396,8 @@ export async function scoreAllMessages(
     scores = await scoreMessagesLlm(messages, {
       modelRegistry: llmOpts.modelRegistry,
       signal: llmOpts.signal,
+      providerId: llmOpts.providerId,
+      modelId: llmOpts.modelId,
     });
     if (scores) method = "llm";
   }

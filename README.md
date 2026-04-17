@@ -2,7 +2,7 @@
 
 A monorepo of pi extensions that make it less shitty.
 
-Some of these should go into pi-mono but trying to suggest issues and PRs to Mario Zechner truned out to be a shitty experience. Shitty Coders Club means coders being treated like shit. Thankfully soon to be sorted out by AI.
+Some of these should go into pi-mono but trying to suggest issues and PRs to Mario Zechner truned out to be a shitty experience. Shitty Coders Club == contributors are being treated like shit. Thankfully soon to be sorted out by AI.
 
 Vibed by my clanker. Use at your own risk. I test as I go.
 

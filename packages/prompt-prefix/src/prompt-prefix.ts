@@ -72,35 +72,66 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// ── 1. Prepend prefix to every interactive user prompt ──────────────────
+	// ── 1. Prepend prefix to user messages at display time ──────────────────
 	//
-	// The transformed text is what gets stored in the session and shown in the
-	// TUI — giving you the visual prefix in the chat history.
-	//
-	// Skip prefix for queued messages (Alt+Enter while streaming): ctx.isIdle()
-	// returns false during streaming, meaning the input is being queued rather
-	// than submitted directly. This keeps the follow-up queue clean so Alt+Up
-	// dequeue restores text without the prefix.
+	// Hook message_start to add the prefix for TUI rendering only. The prefix
+	// is never stored in the session and never sent to the LLM.
 
-	pi.on("input", (event, ctx) => {
-		if (!cfg.enabled) return { action: "continue" };
-		if (event.source !== "interactive") return { action: "continue" };
-		// trimStart so leading spaces don't mask commands like "  /cmd"
-		if (event.text.trimStart().startsWith("/")) return { action: "continue" };
-		// trim catches all whitespace variants for the empty-input guard
-		if (!event.text.trim()) return { action: "continue" };
-		// Skip prefix for queued messages (Alt+Enter / Alt+Shift+Enter while streaming)
-		if (!ctx.isIdle()) return { action: "continue" };
+	pi.on("message_start", (event) => {
+		if (!cfg.enabled) return;
+		if (event.message.role !== "user") return;
 
-		return { action: "transform", text: `${cfg.prefix}${event.text}` };
+		const { prefix } = cfg;
+		const msg = event.message;
+
+		if (typeof msg.content === "string") {
+			if (msg.content.trimStart().startsWith("/")) return;
+			if (!msg.content.trim()) return;
+			msg.content = `${prefix}${msg.content}`;
+		} else if (Array.isArray(msg.content)) {
+			// Find the first text block
+			for (const block of msg.content) {
+				if (block.type === "text" && typeof block.text === "string") {
+					if (block.text.trimStart().startsWith("/")) return;
+					if (!block.text.trim()) return;
+					block.text = `${prefix}${block.text}`;
+					return;
+				}
+			}
+		}
 	});
 
-	// ── 2. Strip prefix before messages are sent to the LLM ─────────────────
+	// ── 2. Strip prefix before persistence ──────────────────────────────────
 	//
-	// The context event fires right before each LLM call. We remove the prefix
-	// from every user message in the payload so the model never sees it.
-	// This keeps the prefix purely cosmetic with no impact on model behaviour
-	// or token usage.
+	// Revert the display-only prefix so the session file stays clean.
+	// The TUI has already rendered the prefixed version by this point.
+
+	pi.on("message_end", (event) => {
+		if (!cfg.enabled) return;
+		if (event.message.role !== "user") return;
+
+		const { prefix } = cfg;
+		const msg = event.message;
+
+		if (typeof msg.content === "string") {
+			if (msg.content.startsWith(prefix)) {
+				msg.content = msg.content.slice(prefix.length);
+			}
+		} else if (Array.isArray(msg.content)) {
+			for (const block of msg.content) {
+				if (block.type === "text" && typeof block.text === "string" && block.text.startsWith(prefix)) {
+					block.text = block.text.slice(prefix.length);
+					return;
+				}
+			}
+		}
+	});
+
+	// ── 3. Strip prefix from stored messages on session reload ──────────────
+	//
+	// When a session is reloaded, old messages that were stored with the prefix
+	// (before the message_start/message_end approach) need to be cleaned up
+	// before being sent to the LLM.
 
 	pi.on("context", (event) => {
 		if (!cfg.enabled) return;
@@ -110,7 +141,6 @@ export default function (pi: ExtensionAPI) {
 		const messages = event.messages.map((msg) => {
 			if (msg.role !== "user") return msg;
 
-			// content can be a plain string or an array of content blocks
 			if (typeof msg.content === "string") {
 				if (!msg.content.startsWith(prefix)) return msg;
 				return { ...msg, content: msg.content.slice(prefix.length) };
@@ -118,7 +148,6 @@ export default function (pi: ExtensionAPI) {
 
 			if (!Array.isArray(msg.content)) return msg;
 
-			// Strip from the first text block only (prefix is always at the start)
 			let stripped = false;
 			const newContent = msg.content.map(
 				(block: { type: string; text?: string } & Record<string, unknown>) => {
@@ -141,7 +170,7 @@ export default function (pi: ExtensionAPI) {
 		return { messages };
 	});
 
-	// ── 3. /prompt-prefix command ────────────────────────────────────────────
+	// ── 4. /prompt-prefix command ────────────────────────────────────────────
 
 	pi.registerCommand("prompt-prefix", {
 		description:
