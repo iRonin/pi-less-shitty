@@ -1,0 +1,27 @@
+{
+  "name": "@ironin/pi-git-permissions",
+  "version": "1.0.0",
+  "description": "Git-aware file permissions guard for pi.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
