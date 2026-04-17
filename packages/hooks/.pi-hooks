@@ -1,0 +1,2 @@
+# Example: Allow all git commands
+allow ^\s*git\s

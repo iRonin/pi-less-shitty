@@ -1,0 +1,29 @@
+{
+  "name": "@ironin/pi-hooks",
+  "version": "1.0.0",
+  "description": "Flexible directory-based permission system for pi bash commands via .pi-hooks config files.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "permissions",
+    "security"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
