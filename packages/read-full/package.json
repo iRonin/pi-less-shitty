@@ -1,13 +1,15 @@
 {
-  "name": "@ironin/pi-read-full",
+  "name": "pi-ironin-read-full",
   "version": "1.0.0",
   "description": "Read entire files with configurable cap. Bypasses the built-in read tool's 50KB/2000-line limit.",
   "license": "MIT",
   "author": "CK @ iRonin.IT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ironin/pi-read-full"
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/read-full"
   },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
   "type": "module",
   "exports": {
     ".": "./src/read-full.ts"

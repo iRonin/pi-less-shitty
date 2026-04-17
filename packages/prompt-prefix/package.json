@@ -1,9 +1,15 @@
 {
-  "name": "@ironin/pi-prompt-prefix",
+  "name": "pi-ironin-prompt-prefix",
   "version": "1.0.0",
   "description": "Visual-only prefix prepended to every user prompt in the TUI. Stripped before LLM — zero token cost.",
   "license": "MIT",
   "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/prompt-prefix"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
   "type": "module",
   "exports": {
     ".": "./src/prompt-prefix.ts"

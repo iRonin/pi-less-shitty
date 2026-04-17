@@ -1,9 +1,15 @@
 {
-  "name": "@ironin/pi-smart-compaction",
+  "name": "pi-ironin-smart-compaction",
   "version": "1.0.0",
-  "description": "Heuristic turn scoring for pi compaction instead of blanket LLM summary.",
+  "description": "Smart session compaction with LLM scoring. Uses gemini-2.5-flash-lite to score turns 0-10, keeping HIGH verbatim, summarizing MEDIUM, dropping LOW. Configurable provider/model via settings.json.",
   "license": "MIT",
   "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/smart-compaction"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
   "type": "module",
   "exports": {
     ".": "./src/smart-compaction.ts"
@@ -20,9 +26,11 @@
     "pi-package",
     "pi-coding-agent",
     "pi-extension",
-    "compaction"
+    "compaction",
+    "session"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*"
   }
 }

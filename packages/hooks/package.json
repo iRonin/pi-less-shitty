@@ -1,9 +1,15 @@
 {
-  "name": "@ironin/pi-hooks",
+  "name": "pi-ironin-hooks",
   "version": "1.0.0",
   "description": "Flexible directory-based permission system for pi bash commands via .pi-hooks config files.",
   "license": "MIT",
   "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/hooks"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -13,7 +19,8 @@
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./src/index.ts",
+      "./src/safety-hooks.ts"
     ]
   },
   "keywords": [

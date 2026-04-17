@@ -1,9 +1,15 @@
 {
-  "name": "@ironin/pi-cascading-skills",
+  "name": "pi-ironin-cascading-skills",
   "version": "1.0.0",
   "description": "Walks parent directories to collect skills from every .pi/ level, solving pi's array-replacement behavior for skills.",
   "license": "MIT",
   "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/cascading-skills"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
   "type": "module",
   "exports": {
     ".": "./src/cascading-skills.ts"

@@ -1,9 +1,15 @@
 {
-  "name": "@ironin/pi-session-title",
+  "name": "pi-ironin-session-title",
   "version": "1.0.0",
-  "description": "Auto-title pi sessions.",
+  "description": "Auto-title pi sessions in the terminal title bar.",
   "license": "MIT",
   "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/session-title"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

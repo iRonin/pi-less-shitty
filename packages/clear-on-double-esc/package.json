@@ -1,9 +1,15 @@
 {
-  "name": "@ironin/pi-clear-on-double-esc",
+  "name": "pi-ironin-clear-on-double-esc",
   "version": "1.0.0",
   "description": "Clear the editor on double Escape keypress.",
   "license": "MIT",
   "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/clear-on-double-esc"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
