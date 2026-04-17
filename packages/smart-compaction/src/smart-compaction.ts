@@ -1061,7 +1061,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
     ctx.ui.setStatus("smart-compaction", undefined);
   });
 
