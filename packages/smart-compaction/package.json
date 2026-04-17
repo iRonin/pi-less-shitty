@@ -1,0 +1,28 @@
+{
+  "name": "@ironin/pi-smart-compaction",
+  "version": "1.0.0",
+  "description": "Heuristic turn scoring for pi compaction instead of blanket LLM summary.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/smart-compaction.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/smart-compaction.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "compaction"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
