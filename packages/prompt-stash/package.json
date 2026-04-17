@@ -1,0 +1,27 @@
+{
+  "name": "@ironin/pi-prompt-stash",
+  "version": "1.0.0",
+  "description": "Ctrl+S to stash/pop prompts. Ctrl+Shift+S for stash picker. Per-CWD directory storage.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/prompt-stash.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/prompt-stash.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
