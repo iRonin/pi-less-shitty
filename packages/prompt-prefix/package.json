@@ -1,0 +1,28 @@
+{
+  "name": "@ironin/pi-prompt-prefix",
+  "version": "1.0.0",
+  "description": "Visual-only prefix prepended to every user prompt in the TUI. Stripped before LLM — zero token cost.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/prompt-prefix.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/prompt-prefix.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "peerDependencies": {
+    "@sinclair/typebox": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
