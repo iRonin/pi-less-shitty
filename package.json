@@ -1,0 +1,34 @@
+{
+  "name": "@ironin/pi-less-shitty",
+  "version": "1.0.0",
+  "description": "A monorepo of pi extensions that make it less shitty.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ironin/pi-less-shitty"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "pi": {
+    "extensions": [
+      "packages/cascading-skills/src/cascading-skills.ts",
+      "packages/clear-on-double-esc/src/index.ts",
+      "packages/kilocode-model-fix/src/kilocode-model-fix.ts",
+      "packages/git-permissions/src/index.ts",
+      "packages/hindsight/index.ts",
+      "packages/hooks/src/index.ts",
+      "packages/hooks/src/safety-hooks.ts",
+      "packages/keybindings/index.ts",
+      "packages/prompt-prefix/src/prompt-prefix.ts",
+      "packages/prompt-stash/src/prompt-stash.ts",
+      "packages/read-full/src/read-full.ts",
+      "packages/session-recall/src/session-recall.ts",
+      "packages/session-title/src/index.ts",
+      "packages/smart-compaction/src/smart-compaction.ts"
+    ]
+  }
+}
