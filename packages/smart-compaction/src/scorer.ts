@@ -10,7 +10,8 @@
  * when the LLM call fails (no API key, timeout, model unavailable, etc.).
  */
 
-import { complete } from "@mariozechner/pi-ai";
+// LLM scoring uses dynamic import of @mariozechner/pi-ai to avoid
+// dependency issues when running standalone heuristic tests.
 
 // ---------------------------------------------------------------------------
 // LLM batch scorer
@@ -83,6 +84,7 @@ ${lines}
 Return ONLY the JSON object, no other text.`;
 
   try {
+    const { complete } = await import("@mariozechner/pi-ai");
     const response = await complete(
       model,
       {
