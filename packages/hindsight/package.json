@@ -1,0 +1,34 @@
+{
+  "name": "@ironin/pi-hindsight",
+  "version": "0.1.0",
+  "description": "Domain-aware agent memory via Hindsight",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "hindsight",
+    "memory"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/hindsight"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "pi": {
+    "extensions": ["index.ts"],
+    "skills": ["skills/hindsight"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "*"
+  }
+}

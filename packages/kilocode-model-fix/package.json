@@ -1,0 +1,19 @@
+{
+  "name": "@ironin/pi-kilocode-model-fix",
+  "version": "1.0.0",
+  "description": "Fix kilocode (and other custom provider) default model resolution at startup",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/kilocode-model-fix.ts"
+  },
+  "files": ["src/"],
+  "pi": {
+    "extensions": ["./src/kilocode-model-fix.ts"]
+  },
+  "keywords": ["pi-package", "pi-coding-agent", "pi-extension"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
