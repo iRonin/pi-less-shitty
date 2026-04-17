@@ -1,0 +1,27 @@
+{
+  "name": "@ironin/pi-session-recall",
+  "version": "1.0.0",
+  "description": "Session ID + timestamp on exit. /q quick quit, /resume-last, /sessions browse & switch.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/session-recall.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/session-recall.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
