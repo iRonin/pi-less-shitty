@@ -152,168 +152,56 @@ function estimateMsgTokens(msg: { role: string; content: unknown }): number {
 }
 
 // ---------------------------------------------------------------------------
-// Structured summary builder — mirrors pi's format
+// ---------------------------------------------------------------------------
+// LLM-driven smart summary — ONE call, ALL messages, NO manual truncation
 // ---------------------------------------------------------------------------
 
-function buildStructuredSummary(
+async function generateSmartSummary(
   scoredFlat: Array<{ role: string; content: unknown; score: number; classification: string }>,
   loops: RetryLoop[],
-  highSummary: string | null,
-  previousSummary: string | undefined,
-  readFiles: string[],
-  modifiedFiles: string[],
-  settings: SmartCompactionSettings,
-): string {
-  const parts: string[] = [];
-
-  if (previousSummary) {
-    parts.push("## Previous Context Checkpoint\n");
-    parts.push(previousSummary);
-    parts.push("\n---\n\n## Updates from Recent Turns\n");
-  }
-
-  // Goal (extract from user HIGH turns)
-  const userDirectives: string[] = [];
-  for (const m of scoredFlat) {
-    if (m.role === "user" && m.classification === "HIGH") {
-      const text = extractText(m.content).trim();
-      if (text.length > 5) userDirectives.push(text.substring(0, 500));
-    }
-  }
-  if (userDirectives.length > 0) {
-    parts.push("## Goal\n" + userDirectives.map((d) => `- ${d}`).join("\n") + "\n");
-  }
-
-  // Key Decisions
-  const decisions: string[] = [];
-  for (const m of scoredFlat) {
-    if (m.role === "assistant" && m.classification === "HIGH") {
-      const text = extractText(m.content).trim();
-      if (text.length > 10) decisions.push(text.substring(0, 500));
-    }
-  }
-  if (decisions.length > 0) {
-    parts.push("## Key Decisions\n" + decisions.map((d) => `- ${d}`).join("\n") + "\n");
-  }
-
-  // Retry loops
-  if (loops.length > 0) {
-    parts.push("## Collapsed Retry Loops\n");
-    for (const loop of loops) {
-      parts.push(`- ${loop.description}`);
-      if (loop.lastResult) {
-        parts.push(`  Final: ${loop.lastResult.substring(0, 150)}`);
-      }
-    }
-    parts.push("");
-  }
-
-  // LLM summary of HIGH turns
-  if (highSummary) {
-    parts.push("## Context Summary (High-Value Turns)\n");
-    parts.push(highSummary);
-    parts.push("\n*The full HIGH turn messages are also preserved verbatim. " +
-      "This summary survives if this section is compacted again later.*\n");
-  }
-
-  // Deterministic summary of MEDIUM (+ LOW)
-  const relevant = scoredFlat.filter(
-    (m) => m.classification === "MEDIUM" || (settings.summarizeLow && m.classification === "LOW"),
-  );
-  if (relevant.length > 0) {
-    const toolLines: string[] = [];
-    const toolCallsByType: Record<string, { label: string; count: number }> = {};
-    const allPaths: string[] = [];
-    const excerpts: string[] = [];
-    const FILE_PATH_RE = /[/\\][\w.\-/]+(?:\.\w+)?/g;
-
-    for (const msg of relevant) {
-      for (const tc of extractToolCalls(msg.content)) {
-        if (!toolCallsByType[tc.name]) toolCallsByType[tc.name] = { label: tc.name, count: 0 };
-        toolCallsByType[tc.name].count++;
-        const args = typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments);
-        const pathMatch = args.match(/"path"\s*:\s*"([^"]+)"/);
-        const cmdMatch = args.match(/"command"\s*:\s*"([^"]+)"/);
-        if (pathMatch) {
-          toolCallsByType[tc.name].label = `${tc.name}(${pathMatch[1]})`;
-          allPaths.push(pathMatch[1]);
-        } else if (cmdMatch) {
-          toolCallsByType[tc.name].label = `${tc.name}("${cmdMatch[1].substring(0, 80)}")`;
-        }
-      }
-      const text = extractText(msg.content);
-      const paths = text.match(FILE_PATH_RE) ?? [];
-      allPaths.push(...paths.filter((p: string) => p.length > 5 && !p.startsWith("/dev/")));
-      const trimmed = text.trim();
-      if (trimmed.length > 10 && !/^(ok|got it|sure|will do|on it|let me|oops)/i.test(trimmed)) {
-        excerpts.push(trimmed.substring(0, 300));
-      }
-    }
-
-    for (const [, info] of Object.entries(toolCallsByType)) {
-      toolLines.push(`- ${info.label} (${info.count}×)`);
-    }
-    if (toolLines.length > 0) {
-      parts.push("## Tool Activity\n" + toolLines.join("\n") + "\n");
-    }
-
-    const uniquePaths = [...new Set(allPaths)].slice(0, 20);
-    if (uniquePaths.length > 0) {
-      parts.push("## Files Referenced\n" + uniquePaths.map((p) => `- ${p}`).join("\n") + "\n");
-    }
-
-    if (excerpts.length > 0) {
-      parts.push("## Key Content\n" + excerpts.slice(0, 8).map((t) => `> ${t}`).join("\n\n") + "\n");
-    }
-
-    parts.push(`*${relevant.length} turns condensed above*\n`);
-  }
-
-  // LOW omitted marker
-  const lowCount = scoredFlat.filter((m) => m.classification === "LOW").length;
-  if (lowCount > 0 && !settings.summarizeLow) {
-    parts.push(`> ${lowCount} low-value turns omitted (acknowledgments, retries with no substantive content)\n`);
-  }
-
-  // File operations
-  if (readFiles.length > 0) {
-    parts.push("<read-files>\n" + readFiles.join("\n") + "\n</read-files>\n");
-  }
-  if (modifiedFiles.length > 0) {
-    parts.push("<modified-files>\n" + modifiedFiles.join("\n") + "\n</modified-files>\n");
-  }
-
-  return parts.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// LLM summary for HIGH turns
-// ---------------------------------------------------------------------------
-
-async function generateHighSummary(
-  highAgentMessages: any[],
   signal: AbortSignal,
   modelRegistry: any,
+  settings: SmartCompactionSettings,
   previousSummary?: string,
   customInstructions?: string,
+  readFiles?: string[],
+  modifiedFiles?: string[],
 ): Promise<string | null> {
-  if (highAgentMessages.length === 0) return null;
+  if (scoredFlat.length === 0) return null;
 
-  const llmMessages = convertToLlm(highAgentMessages);
-  const conversationText = serializeConversation(llmMessages);
+  // Build full message list for the LLM — no truncation, every message intact
+  const llmMessages = scoredFlat.map((m) => ({
+    role: m.role,
+    content: m.content,
+  }));
+  const conversationText = serializeConversation(convertToLlm(llmMessages as any[]));
 
-  const model = modelRegistry.find("google", "gemini-2.5-flash")
-    ?? modelRegistry.find("openai", "gpt-4o-mini")
-    ?? modelRegistry.find("anthropic", "claude-sonnet-4-20250514");
+  // Build score annotations so LLM knows what's important
+  const scoreAnnotations = scoredFlat.map((m, i) => {
+    return `Turn #${i + 1} [${m.role}] score=${m.score} class=${m.classification}`;
+  }).join("\n");
 
-  if (!model) return null;
-  const auth = await modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) return null;
+  const loopContext = loops.length > 0
+    ? `\n\nRetry loops detected (${loops.length}):\n${loops.map((l) => `- ${l.description}${l.lastResult ? ` → ${l.lastResult}` : ""}`).join("\n")}`
+    : "";
 
   const prevCtx = previousSummary
     ? `\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\nIntegrate with and update the previous summary. Preserve existing goals/decisions/progress.`
     : "";
   const focusCtx = customInstructions ? `\n\nAdditional focus: ${customInstructions}` : "";
+
+  const filesCtx = (readFiles?.length ?? 0) > 0 || (modifiedFiles?.length ?? 0) > 0
+    ? `\n\nFiles read: ${readFiles?.join(", ") || "none"}\nFiles modified: ${modifiedFiles?.join(", ") || "none"}`
+    : "";
+
+  // Use configured scoring model first, fall back to the main session model
+  let model = modelRegistry.find(settings.scoringProvider, settings.scoringModel);
+  if (!model) {
+    model = modelRegistry.currentModel ?? modelRegistry.find(modelRegistry.defaultProvider, modelRegistry.defaultModel);
+  }
+  if (!model) return null;
+  const auth = await modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) return null;
 
   try {
     const response = await complete(
@@ -322,37 +210,47 @@ async function generateHighSummary(
         role: "user" as const,
         content: [{
           type: "text" as const,
-          text: `You are a context summarization assistant. Create a structured checkpoint summary that another LLM will use to continue the work.
+          text: `You are a session continuation assistant. The agent's conversation was just compacted. The next agent turn will ONLY see this summary — it must contain everything needed to pick up exactly where the agent left off.
+
+GOAL: Distill the essential knowledge required to continue the session. Strip out all noise.
+
+What matters:
+- What is being worked on and WHY
+- The current state of things (what files exist, what code looks like now, what's broken/fixed)
+- Key decisions and their rationale (what approach was chosen and WHY)
+- What needs to happen next
+- Critical technical details (exact paths, function names, gotchas, workarounds)
+
+What does NOT matter:
+- Small back-and-forth conversation ("ok", "got it", "let me check")
+- Every individual edit made (only the final result matters)
+- Exploratory dead ends that led nowhere
+- Step-by-step narration of what was done
+
+Turn classifications:\n${scoreAnnotations}${loopContext}
 
 Use this EXACT format:
 
-## Goal
-[What is the user trying to accomplish?]
-
-## Progress
-### Done
-- [x] [Completed items]
-
-### In Progress
-- [ ] [Current work]
-
-### Blocked
-- [Blockers, if any]
+## Context
+[What are we working on? What's the goal? What's the current state?]
 
 ## Key Decisions
-- **[Decision]**: [Rationale]
+- [Important decisions made and WHY — this is critical for not undoing good work]
 
-## Next Steps
-1. [What should happen next]
+## Current State
+[What exists now? What files were changed? What's the codebase state?]
 
-## Critical Context
-- [Data needed to continue]
+## Critical Details
+- [Exact file paths, function names, configurations, gotchas — anything the next agent MUST know]
 
-Be concise. Preserve exact file paths, function names, and error messages.
+## What's Next
+[What should happen next? What's incomplete? What's blocked?]
+
+Be dense with information. Every line should be something the next agent needs to know. If you wouldn't tell the next agent something, don't include it.
 
 <conversation>
 ${conversationText}
-</conversation>${prevCtx}${focusCtx}`,
+</conversation>${prevCtx}${focusCtx}${filesCtx}`,
         }],
         timestamp: Date.now(),
       }] },
@@ -435,13 +333,6 @@ async function handleSmartCompaction(
 
   const loops = detectRetryLoops(flatMsgs, settings.retryWindow);
 
-  let highSummary: string | null = null;
-  if (settings.summarizeHigh && highCount > 0) {
-    ctx.ui.setWorkingMessage("Smart compaction: summarizing high-value turns…");
-    const highAgentMsgs = allMsgs.filter((_: any, i: number) => scored[i].classification === "HIGH");
-    highSummary = await generateHighSummary(highAgentMsgs, signal, ctx.modelRegistry, previousSummary, customInstructions);
-  }
-
   const readFiles = [...(fileOps?.read ?? [])];
   const modifiedFiles = [...(fileOps?.written ?? []), ...(fileOps?.edited ?? [])];
 
@@ -451,9 +342,20 @@ async function handleSmartCompaction(
     classification: scored[i].classification,
   }));
 
-  let summary = buildStructuredSummary(
-    scoredFlat, loops, highSummary, previousSummary, readFiles, modifiedFiles, settings,
+  // ONE LLM call — all messages, full content, no truncation
+  ctx.ui.setWorkingMessage("Smart compaction: generating continuation summary…");
+  const summary = await generateSmartSummary(
+    scoredFlat, loops, signal, ctx.modelRegistry, settings,
+    previousSummary, customInstructions, readFiles, modifiedFiles,
   );
+
+  if (!summary) {
+    throw new Error(
+      `Smart compaction: LLM summarization failed. ` +
+      `Model ${settings.scoringProvider}:${settings.scoringModel} returned no summary. ` +
+      `Compaction aborted — no changes applied.`,
+    );
+  }
 
   if (isSplitTurn && turnPrefixMessages.length > 0) {
     summary += "\n\n> **Split turn note:** Earlier parts of this turn were summarized above. " +
@@ -477,7 +379,7 @@ async function handleSmartCompaction(
     tokensSavedEstimate: tokensSaved,
     actualKeepThreshold: settings.keepThreshold,
     actualDropThreshold: settings.dropThreshold,
-    llmUsed: !!highSummary || scoringMethod === "llm",
+    llmUsed: !!summary,
     scoringMethod,
   };
 
@@ -645,9 +547,8 @@ function analyzeMessages(
     score: scored[i].score, classification: scored[i].classification,
   }));
 
-  const summary = buildStructuredSummary(
-    scoredFlat, loops, null, previousSummary, [], [], settings,
-  );
+  // Dry-run: no LLM needed, just a placeholder summary
+  const summary = `[dry-run summary: ${scoredFlat.length} turns scored, ${scoredFlat.filter(s => s.classification === "HIGH").length} HIGH]`;
 
   const highTokens = scored.filter((s) => s.classification === "HIGH")
     .reduce((sum, s, idx) => sum + estimateMsgTokens(flatMsgs[idx]), 0);
