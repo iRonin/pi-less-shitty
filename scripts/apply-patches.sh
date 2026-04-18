@@ -1,38 +1,35 @@
 #!/usr/bin/env bash
-# Re-apply autocompleteBasePaths patches after `npm update @mariozechner/pi-coding-agent`
+# Apply dist patches to the installed pi package.
 # Usage: bash scripts/apply-patches.sh
 set -euo pipefail
 
-PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches/autocomplete-base-paths" && pwd)"
-BACKUP_DIR="$PATCH_DIR/dist-backup"
 PI_DIR="/opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent"
+PATCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches" && pwd)"
 
-echo "=== Applying autocompleteBasePaths patches ==="
+apply_patch() {
+    local patch_dir="$1"
+    local patch_file="$2"
+    local target="$3"
 
-# Copy patched files over the npm originals
-cp -f "$BACKUP_DIR/settings-manager.js" \
-  "$PI_DIR/dist/core/settings-manager.js"
-echo "✓ settings-manager.js"
+    local abs_target="$PI_DIR/$target"
+    if [ ! -f "$abs_target" ]; then
+        echo "⚠ SKIP: $(basename "$patch_file") — target not found: $target"
+        return
+    fi
 
-cp -f "$BACKUP_DIR/autocomplete.js" \
-  "$PI_DIR/node_modules/@mariozechner/pi-tui/dist/autocomplete.js"
-echo "✓ autocomplete.js"
+    if patch --quiet --forward "$abs_target" < "$patch_file" 2>/dev/null; then
+        echo "✓ $(basename "$patch_file") → $target"
+    else
+        echo "✗ $(basename "$patch_file") — patch failed (upstream changed?)"
+        return 1
+    fi
+}
 
-cp -f "$BACKUP_DIR/interactive-mode.js" \
-  "$PI_DIR/dist/modes/interactive/interactive-mode.js"
-echo "✓ interactive-mode.js"
+echo "=== Applying dist patches ==="
 
-echo "=== Applying user-message-borders patch (yellow borders + fix iTerm2 OSC133 corruption) ==="
-
-BORDER_PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches/user-message-borders" && pwd)"
-BORDER_BACKUP_DIR="$BORDER_PATCH_DIR/dist-backup"
-
-cp -f "$BORDER_BACKUP_DIR/user-message.js" \
-  "$PI_DIR/dist/modes/interactive/components/user-message.js"
-echo "✓ user-message.js"
-
-cp -f "$BORDER_BACKUP_DIR/assistant-message.js" \
-  "$PI_DIR/dist/modes/interactive/components/assistant-message.js"
-echo "✓ assistant-message.js"
+# user-message-borders: patch user-message.js
+apply_patch "user-message-borders" \
+    "$PATCH_ROOT/user-message-borders/user-message.patch" \
+    "dist/modes/interactive/components/user-message.js"
 
 echo "=== All patches applied. Restart pi. ==="
