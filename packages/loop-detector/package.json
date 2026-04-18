@@ -1,0 +1,19 @@
+{
+  "name": "@ironin/pi-loop-detector",
+  "version": "1.0.0",
+  "description": "Detects degenerate tool-call loops (generic_repeat, poll_no_progress, ping_pong) and breaks them before they waste tokens.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src/"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "keywords": ["pi-package", "pi-coding-agent", "pi-extension", "loop-detection", "agent-safety"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "name": "@ironin/pi-autocomplete-base-paths",
+  "version": "1.0.0",
+  "description": "Multi-directory file autocomplete with per-project config. Type @ to fuzzy-search files across configured root directories.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ironin/pi-less-shitty",
+    "directory": "packages/autocomplete-base-paths"
+  },
+  "homepage": "https://github.com/ironin/pi-less-shitty#readme",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/",
+    "patches/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "autocomplete",
+    "file-search"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

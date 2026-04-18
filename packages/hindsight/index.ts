@@ -50,6 +50,7 @@ interface ResolvedConfig {
   bank_id: string | null;
   global_bank: string | null;
   recall_types: string[];
+  strip_patterns: string[];
 }
 
 function parseToml(filePath: string): Record<string, string> {
@@ -84,6 +85,9 @@ function resolveConfig(cwd: string): ResolvedConfig | null {
       recall_types: merged.recall_types
         ? merged.recall_types.split(",").map(t => t.trim()).filter(Boolean)
         : ["observation"],
+      strip_patterns: merged.strip_patterns
+        ? merged.strip_patterns.split(",").map(p => p.trim()).filter(Boolean)
+        : [],
     };
   } catch { return null; }
 }
@@ -108,10 +112,69 @@ function getActiveBank(config: ResolvedConfig): string | null {
   return config.bank_id;
 }
 
+// ─── Configurable Stripping Patterns ─────────────────────────────────────
+
+const DEFAULT_STRIP_PATTERNS: RegExp[] = [
+  // Prevent feedback loop: injected memories from previous recall
+  /<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g,
+  // Remove reasoning/thinking blocks (not factual content)
+  /<(?:antThinking|thinking|reasoning)>[\s\S]*?<\/(?:antThinking|thinking|reasoning)>/g,
+  // Remove inline base64 images (massive noise for text memory)
+  /data:[^;]+;base64,[A-Za-z0-9+/=]{100,}/g,
+];
+
+function getStripPatterns(config: ResolvedConfig): RegExp[] {
+  if (config.strip_patterns?.length) {
+    return config.strip_patterns.map((p) => new RegExp(p, "g"));
+  }
+  return DEFAULT_STRIP_PATTERNS;
+}
+
 function extractTags(prompt: string): string[] {
   const reserved = new Set(["nomem", "skip", "global", "me"]);
   return Array.from(prompt.matchAll(/(?<=^|\s)#([a-zA-Z0-9_-]+)/g))
     .map(m => m[1].toLowerCase()).filter(t => !reserved.has(t));
+}
+
+// ─── Transcript Builder ─────────────────────────────────────────────────
+
+interface AssistantMessage {
+  role: string;
+  content?: string | Array<{ type: string; name?: string; text?: string; input?: unknown }>;
+}
+
+function buildTranscript(prompt: string, messages: AssistantMessage[], stripPatterns: RegExp[]): string {
+  let transcript = `[role: user]\n${prompt}\n[user:end]\n\n[role: assistant]\n`;
+  for (const msg of messages) {
+    if (msg.role !== "assistant") continue;
+    const content = msg.content;
+    if (typeof content === "string") {
+      transcript += `${content}\n`;
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block.type === "text") transcript += `${block.text}\n`;
+        else if (block.type === "tool_use" && !OPERATIONAL_TOOLS.has(block.name))
+          transcript += `[Tool: ${block.name}]\n${block.input ? JSON.stringify(block.input) : ""}\n`;
+      }
+    }
+  }
+  transcript += `[assistant:end]`;
+  for (const pattern of stripPatterns) {
+    transcript = transcript.replace(pattern, "");
+  }
+  return transcript.trim();
+}
+
+// ─── Retain Filtering ───────────────────────────────────────────────────
+
+const TRIVIAL_PROMPT_RE = /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i;
+
+function shouldSkipRetain(prompt: string | null): { skip: boolean; reason?: string } {
+  if (!prompt) return { skip: true, reason: "no prompt" };
+  if (prompt.length < 5) return { skip: true, reason: "too short" };
+  if (TRIVIAL_PROMPT_RE.test(prompt.trim())) return { skip: true, reason: "trivial" };
+  if (prompt.trim().startsWith("#nomem") || prompt.trim().startsWith("#skip")) return { skip: true, reason: "opt-out" };
+  return { skip: false };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -378,35 +441,20 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     if (!config?.api_url) return;
 
     const prompt = getLastUserMessage(ctx, currentPrompt);
-    if (!prompt) return;
-    if (prompt.length < 5 || /^(ok|yes|no|thanks|continue|next|done|sure|stop)$/i.test(prompt.trim())) return;
-    if (prompt.trim().startsWith("#nomem") || prompt.trim().startsWith("#skip")) return;
+    const skipCheck = shouldSkipRetain(prompt);
+    if (skipCheck.skip) { log(`agent_end: skip (${skipCheck.reason})`); return; }
 
     const bank = getActiveBank(config);
     if (!bank) return;
 
     const tags = extractTags(prompt);
     const banks = getRetainBanks(config, prompt);
+    const stripPatterns = getStripPatterns(config);
 
     // Build transcript
-    let transcript = `[role: user]\n${prompt}\n[user:end]\n\n[role: assistant]\n`;
-    for (const msg of event.messages || []) {
-      if (msg.role !== "assistant") continue;
-      const content = msg.content;
-      if (typeof content === "string") {
-        transcript += `${content}\n`;
-      } else if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block.type === "text") transcript += `${block.text}\n`;
-          else if (block.type === "tool_use" && !OPERATIONAL_TOOLS.has(block.name))
-            transcript += `[Tool: ${block.name}]\n${block.input ? JSON.stringify(block.input) : ""}\n`;
-        }
-      }
-    }
-    transcript += `[assistant:end]`;
-    transcript = transcript.replace(/<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g, "").trim();
-    if (transcript.length < 20) return;
-    if (transcript.length > 50000) transcript = transcript.slice(0, 50000) + "\n...[TRUNCATED]";
+    const rawTranscript = buildTranscript(prompt, event.messages || [], stripPatterns);
+    if (rawTranscript.length < 20) return;
+    let transcript = rawTranscript.length > 50000 ? rawTranscript.slice(0, 50000) + "\n...[TRUNCATED]" : rawTranscript;
 
     const sessionId = ctx.sessionManager?.getSessionId?.() || `unknown-${Date.now()}`;
     log(`retain: banks=${banks.join(",")} len=${transcript.length} tags=${tags.join(",")}`);

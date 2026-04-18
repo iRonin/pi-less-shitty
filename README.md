@@ -10,21 +10,23 @@ Vibed by my clanker. Use at your own risk. I test as I go.
 
 | Package | Description |
 |---------|-------------|
+| `@ironin/pi-autocomplete-base-paths` | Multi-directory `@` file autocomplete with per-project config (runtime patch) |
 | `@ironin/pi-cascading-skills` | Walks parent dirs to collect skills from every `.pi/` level |
 | `@ironin/pi-clear-on-double-esc` | Clear editor on double Escape |
 | `@ironin/pi-git-permissions` | Git-aware file permissions guard |
-| `@ironin/pi-image-paste` | Clipboard image paste → sends image data to LLM instead of file path |
+| `@ironin/pi-hindsight` | Domain-aware persistent memory via Hindsight (recall/retain/reflect) |
+| `@ironin/pi-hooks` | Regex-based permission system with `.pi-hooks` files |
+| `@ironin/pi-keybindings` | Custom keybindings with wizard |
+| `@ironin/pi-kilocode-model-fix` | Fixes custom-provider (kilocode, etc.) default model resolution at startup |
+| `@ironin/pi-loop-detector` | Detects and prevents infinite retry loops |
+| `@ironin/pi-model-sort-fix` | Fixes `:variant` sort order bug — base models preferred over `:free`, `:nitro`, etc. |
+| `@ironin/pi-model-registry-fix` | Fixes apiKey validation (#3043) and models.json wipe (#3044) in model registry |
 | `@ironin/pi-prompt-prefix` | Visual-only prefix for user prompts in TUI |
 | `@ironin/pi-prompt-stash` | Ctrl+S stash/pop, Ctrl+Shift+S stash picker, per-CWD storage |
-| `@ironin/pi-kilocode-model-fix` | Fixes custom-provider (kilocode, etc.) default model resolution at startup |
-| `@ironin/pi-model-sort-fix` | Fixes `:variant` sort order bug — base models preferred over `:free`, `:nitro`, etc. |
 | `@ironin/pi-read-full` | Read entire files with configurable cap (bypasses 50KB limit) |
 | `@ironin/pi-session-recall` | Session info on exit, /q, /resume-last, /sessions |
 | `@ironin/pi-session-title` | Auto-title sessions |
 | `@ironin/pi-smart-compaction` | Heuristic turn scoring for compaction instead of blanket LLM summary |
-| `@ironin/pi-hindsight` | Domain-aware persistent memory via Hindsight (recall/retain/reflect) |
-| `@ironin/pi-hooks` | Regex-based permission system with `.pi-hooks` files |
-| `@ironin/pi-keybindings` | Custom keybindings with wizard |
 
 ## Install
 
@@ -33,6 +35,7 @@ Individual packages:
 pi install npm:@ironin/pi-hindsight
 pi install npm:@ironin/pi-read-full
 pi install npm:@ironin/pi-smart-compaction
+pi install npm:@ironin/pi-autocomplete-base-paths
 ```
 
 Or install the whole suite via npm workspace:
@@ -46,6 +49,20 @@ pi install npm:@ironin/pi-less-shitty
 cd ~/Work/Pi-Agent/pi-less-shitty
 # Install dependencies (pi will handle this via package.json pi manifest)
 ```
+
+## Dist Patches
+
+Applied to the installed pi package (`/opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent/dist/`).
+
+Run after every `npm update @mariozechner/pi-coding-agent`:
+```bash
+bash scripts/apply-patches.sh
+```
+
+| Patch | Description | Files |
+|-------|-------------|-------|
+| `autocomplete-base-paths` | Multi-directory `@` file autocomplete | `settings-manager.js`, `autocomplete.js`, `interactive-mode.js` |
+| `user-message-borders` | Yellow horizontal borders on user prompts + removes broken OSC133 shell integration markers that corrupt iTerm2 viewport | `user-message.js`, `assistant-message.js` |
 
 ## License
 

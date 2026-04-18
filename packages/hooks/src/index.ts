@@ -11,6 +11,15 @@ import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import {
+  clearSessionAllowlist,
+  isSessionAllowed,
+  addToSessionAllowlist,
+  askPermission,
+  buildBlockReason,
+  agentDoneSound,
+  isAlreadyPrompting,
+} from "./permission-ui.js";
 
 /**
  * Permission action types
@@ -129,6 +138,20 @@ export function isPathSafe(filePath: string, projectRoot: string): boolean {
 // ============================================================================
 // Configuration Loading
 // ============================================================================
+
+/**
+ * Find existing .pi-hooks or create one at project root.
+ */
+function findOrCreateHooksFile(cwd: string): string | null {
+  const hooksFile = path.join(cwd, ".pi-hooks");
+  if (fs.existsSync(hooksFile)) return hooksFile;
+  try {
+    fs.writeFileSync(hooksFile, "# Pi hooks — auto-created\n", "utf-8");
+    return hooksFile;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Find and parse .pi-hooks file in directory tree
@@ -380,7 +403,7 @@ const HARD_BLOCKS = [
 ];
 
 /**
- * Commands that require approval (cannot be auto-allowed)
+ * Commands that require approval (unless explicitly allowed in .pi-hooks)
  */
 const ALWAYS_ASK = [
   {
@@ -425,40 +448,32 @@ export default function (pi: ExtensionAPI) {
       const cmd = subcmd.trim();
       if (!cmd) continue;
 
-      // ─── Check hard blocks FIRST (cannot be overridden by any rule) ───
+      // ─── 1. Hard blocks (cannot be overridden by anything) ───
       for (const block of HARD_BLOCKS) {
         if (block.pattern.test(cmd)) {
           return { block: true, reason: block.reason };
         }
       }
 
-      // ─── Check always-ask rules SECOND (cannot be bypassed by allow rules) ───
-      let opaqueCommandBlocked = false;
-      for (const askRule of ALWAYS_ASK) {
-        if (askRule.pattern.test(cmd)) {
-          if (!ctx.hasUI) {
-            return {
-              block: true,
-              reason: `${askRule.reason} (no UI for confirmation).`,
-            };
-          }
-
-          const ok = await ctx.ui.confirm(
-            "⚠️ Opaque Command",
-            `${askRule.reason}:\n\n  ${cmd}\n\nAllow?`
-          );
-
-          if (!ok) {
-            return { block: true, reason: "Blocked by user." };
-          }
-          opaqueCommandBlocked = true;
-          break;
-        }
+      // ─── 2. Session allowlist (approved this session) ───
+      if (isSessionAllowed(cmd)) {
+        continue;
       }
 
-      // ─── Check .pi-hooks rules if config exists ───
+      // ─── 2b. Already being prompted by another handler ───
+      if (isAlreadyPrompting(cmd)) {
+        continue; // let the other handler decide
+      }
+
+      // ─── 3. .pi-hooks rules — allow/deny/ask ───
+      // NOTE: checked BEFORE ALWAYS_ASK so .pi-hooks "allow" bypasses opaque check
       if (config) {
         const permission = checkPermission(cmd, config.rules);
+
+        if (permission === "allow") {
+          // Explicitly allowed — skip all remaining checks
+          continue;
+        }
 
         if (permission === "deny") {
           return {
@@ -470,34 +485,69 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (permission === "ask") {
-          if (!ctx.hasUI) {
-            return {
-              block: true,
-              reason: ".pi-hooks: Command requires approval (no UI available).",
-            };
+          const result = await askPermission(cmd, ".pi-hooks: rule requires approval", {
+            select: (title, options) => ctx.ui.select(title, options),
+            input: (title, placeholder) => ctx.ui.input(title, placeholder),
+            confirm: (title, msg) => ctx.ui.confirm(title, msg),
+            hasUI: ctx.hasUI,
+          });
+          if (!result) return { block: true, reason: "Permission dialog dismissed." };
+          if (result.choice === "allow") continue;
+          if (result.choice === "deny" || result.choice === "deny-steer") {
+            return { block: true, reason: buildBlockReason(cmd, result) };
           }
-
-          const ok = await ctx.ui.confirm(
-            "⚠️ Command Permission Check",
-            `This command requires approval:\n\n  ${cmd}\n\nAllow?`
-          );
-
-          if (!ok) {
-            return { block: true, reason: "Blocked by user (.pi-hooks)." };
+          if (result.choice === "allow-session") {
+            addToSessionAllowlist(cmd);
+            continue;
+          }
+          if (result.choice === "allow-permanent" && result.permanentPattern) {
+            addToSessionAllowlist(result.permanentPattern);
+            try {
+              fs.appendFileSync(config.filePath, `\nallow ${result.permanentPattern}\n`);
+            } catch (err) {
+              console.error(`[pi-hooks] Failed to write .pi-hooks: ${err}`);
+            }
+            continue;
           }
         }
-
-        if (permission === "allow") {
-          // Command is explicitly allowed in .pi-hooks
-          // Skip remaining safety checks (file ops, redirects, dangerous cmds)
-          // but hard blocks and opaque checks already ran above
-          continue;
-        }
-
-        // No matching rule - continue to built-in safety checks
       }
 
-      // ─── Check file operations for path safety ───
+      // ─── 4. ALWAYS_ASK — opaque commands (only if no .pi-hooks allow matched) ───
+      for (const askRule of ALWAYS_ASK) {
+        if (askRule.pattern.test(cmd)) {
+          const result = await askPermission(cmd, askRule.reason, {
+            select: (title, options) => ctx.ui.select(title, options),
+            input: (title, placeholder) => ctx.ui.input(title, placeholder),
+            confirm: (title, msg) => ctx.ui.confirm(title, msg),
+            hasUI: ctx.hasUI,
+          });
+          if (!result) return { block: true, reason: "Permission dialog dismissed." };
+          if (result.choice === "allow") continue;
+          if (result.choice === "deny" || result.choice === "deny-steer") {
+            return { block: true, reason: buildBlockReason(cmd, result) };
+          }
+          if (result.choice === "allow-session") {
+            addToSessionAllowlist(cmd);
+            continue;
+          }
+          if (result.choice === "allow-permanent" && result.permanentPattern) {
+            addToSessionAllowlist(result.permanentPattern);
+            // Try to find or create .pi-hooks
+            const hooksFile = findOrCreateHooksFile(ctx.cwd);
+            if (hooksFile) {
+              try {
+                fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`);
+              } catch (err) {
+                console.error(`[pi-hooks] Failed to write .pi-hooks: ${err}`);
+              }
+            }
+            continue;
+          }
+          break;
+        }
+      }
+
+      // ─── 5. File operations — path safety with permission dialog ───
       const fileOpMatch = cmd.match(/(^|\s)(rm|rmdir|unlink|mv|cp|ln)\s/);
       if (fileOpMatch) {
         const fileOp = fileOpMatch[2];
@@ -513,19 +563,26 @@ export default function (pi: ExtensionAPI) {
               : safeRealpath(path.join(ctx.cwd, expanded));
 
             if (!isPathSafe(resolved, projectRoot)) {
-              if (!ctx.hasUI) {
-                return {
-                  block: true,
-                  reason: `'${fileOp}' targets '${arg}' outside project (no UI).`,
-                };
+              const result = await askPermission(cmd, `'${fileOp}' targets '${arg}' outside project`, {
+                select: (title, options) => ctx.ui.select(title, options),
+                input: (title, placeholder) => ctx.ui.input(title, placeholder),
+                confirm: (title, msg) => ctx.ui.confirm(title, msg),
+                hasUI: ctx.hasUI,
+              });
+              if (!result) return { block: true, reason: "Permission dialog dismissed." };
+              if (result.choice === "allow") continue;
+              if (result.choice === "deny" || result.choice === "deny-steer") {
+                return { block: true, reason: buildBlockReason(cmd, result) };
               }
-
-              const ok = await ctx.ui.confirm(
-                `⚠️ ${fileOp} outside project`,
-                `'${fileOp}' targets '${arg}' (outside project):\n\n  ${cmd}\n\nAllow?`
-              );
-
-              if (!ok) return { block: true, reason: "Blocked by user." };
+              if (result.choice === "allow-session") {
+                addToSessionAllowlist(cmd);
+              } else if (result.choice === "allow-permanent" && result.permanentPattern) {
+                addToSessionAllowlist(result.permanentPattern);
+                const hooksFile = findOrCreateHooksFile(ctx.cwd);
+                if (hooksFile) {
+                  try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
+                }
+              }
               break;
             }
           } catch {
@@ -538,19 +595,26 @@ export default function (pi: ExtensionAPI) {
               const projResolved = safeRealpath(projectRoot);
 
               if (!(abs + "/").startsWith(projResolved + "/")) {
-                if (!ctx.hasUI) {
-                  return {
-                    block: true,
-                    reason: `'${fileOp}' targets '${arg}' outside project (no UI).`,
-                  };
+                const result = await askPermission(cmd, `'${fileOp}' targets '${arg}' outside project`, {
+                  select: (title, options) => ctx.ui.select(title, options),
+                  input: (title, placeholder) => ctx.ui.input(title, placeholder),
+                  confirm: (title, msg) => ctx.ui.confirm(title, msg),
+                  hasUI: ctx.hasUI,
+                });
+                if (!result) return { block: true, reason: "Permission dialog dismissed." };
+                if (result.choice === "allow") continue;
+                if (result.choice === "deny" || result.choice === "deny-steer") {
+                  return { block: true, reason: buildBlockReason(cmd, result) };
                 }
-
-                const ok = await ctx.ui.confirm(
-                  `⚠️ ${fileOp} outside project`,
-                  `'${fileOp}' targets '${arg}' (outside project):\n\n  ${cmd}\n\nAllow?`
-                );
-
-                if (!ok) return { block: true, reason: "Blocked by user." };
+                if (result.choice === "allow-session") {
+                  addToSessionAllowlist(cmd);
+                } else if (result.choice === "allow-permanent" && result.permanentPattern) {
+                  addToSessionAllowlist(result.permanentPattern);
+                  const hooksFile = findOrCreateHooksFile(ctx.cwd);
+                  if (hooksFile) {
+                    try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
+                  }
+                }
                 break;
               }
             }
@@ -558,7 +622,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // ─── Check redirects for path safety ───
+      // ─── 6. Redirects — path safety with permission dialog ───
       const redirectTarget = extractRedirectTarget(cmd);
       if (redirectTarget) {
         try {
@@ -568,26 +632,31 @@ export default function (pi: ExtensionAPI) {
             : path.resolve(ctx.cwd, expanded);
 
           if (!isPathSafe(abs, projectRoot)) {
-            if (!ctx.hasUI) {
-              return {
-                block: true,
-                reason: `Redirect to '${redirectTarget}' outside project (no UI).`,
-              };
+            const result = await askPermission(cmd, `Redirect to '${redirectTarget}' outside project`, {
+              select: (title, options) => ctx.ui.select(title, options),
+              input: (title, placeholder) => ctx.ui.input(title, placeholder),
+              confirm: (title, msg) => ctx.ui.confirm(title, msg),
+              hasUI: ctx.hasUI,
+            });
+            if (!result) return { block: true, reason: "Permission dialog dismissed." };
+            if (result.choice === "allow") continue;
+            if (result.choice === "deny" || result.choice === "deny-steer") {
+              return { block: true, reason: buildBlockReason(cmd, result) };
             }
-
-            const ok = await ctx.ui.confirm(
-              "⚠️ Redirect outside project",
-              `Redirect to '${redirectTarget}' (outside project):\n\n  ${cmd}\n\nAllow?`
-            );
-
-            if (!ok) return { block: true, reason: "Blocked by user." };
+            if (result.choice === "allow-session") {
+              addToSessionAllowlist(cmd);
+            } else if (result.choice === "allow-permanent" && result.permanentPattern) {
+              addToSessionAllowlist(result.permanentPattern);
+              const hooksFile = findOrCreateHooksFile(ctx.cwd);
+              if (hooksFile) {
+                try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
+              }
+            }
           }
         } catch {}
       }
 
-      // ─── Check other dangerous commands (only if not explicitly allowed) ───
-      // These checks are skipped if the command was explicitly allowed in .pi-hooks
-      // or if it was an opaque command that already required approval
+      // ─── 7. Dangerous commands (only if not explicitly allowed) ───
       if (!config || checkPermission(cmd, config.rules) !== "allow") {
         const dangerousCmds = [
           {
@@ -618,19 +687,26 @@ export default function (pi: ExtensionAPI) {
 
         for (const dangerous of dangerousCmds) {
           if (dangerous.pattern.test(cmd)) {
-            if (!ctx.hasUI) {
-              return {
-                block: true,
-                reason: `'${dangerous.name}' blocked (no UI for confirmation).`,
-              };
+            const result = await askPermission(cmd, `'${dangerous.name}' detected`, {
+              select: (title, options) => ctx.ui.select(title, options),
+              input: (title, placeholder) => ctx.ui.input(title, placeholder),
+              confirm: (title, msg) => ctx.ui.confirm(title, msg),
+              hasUI: ctx.hasUI,
+            });
+            if (!result) return { block: true, reason: "Permission dialog dismissed." };
+            if (result.choice === "allow") continue;
+            if (result.choice === "deny" || result.choice === "deny-steer") {
+              return { block: true, reason: buildBlockReason(cmd, result) };
             }
-
-            const ok = await ctx.ui.confirm(
-              `⚠️ ${dangerous.name}`,
-              `'${dangerous.name}' detected:\n\n  ${cmd}\n\nAllow?`
-            );
-
-            if (!ok) return { block: true, reason: "Blocked by user." };
+            if (result.choice === "allow-session") {
+              addToSessionAllowlist(cmd);
+            } else if (result.choice === "allow-permanent" && result.permanentPattern) {
+              addToSessionAllowlist(result.permanentPattern);
+              const hooksFile = findOrCreateHooksFile(ctx.cwd);
+              if (hooksFile) {
+                try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
+              }
+            }
             break;
           }
         }
@@ -640,8 +716,9 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   });
 
-  // Notify on session start
+  // Reset session allowlist + notify on session start
   pi.on("session_start", async (_event, ctx) => {
+    clearSessionAllowlist();
     const config = findHooksConfig(ctx.cwd);
     if (config) {
       ctx.ui.notify(
@@ -649,5 +726,10 @@ export default function (pi: ExtensionAPI) {
         "info"
       );
     }
+  });
+
+  // Play soft ding when agent finishes a turn
+  pi.on("agent_end", async (_event, _ctx) => {
+    agentDoneSound();
   });
 }

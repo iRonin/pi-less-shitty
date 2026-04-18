@@ -26,6 +26,9 @@
     "extensions": ["index.ts"],
     "skills": ["skills/hindsight"]
   },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*"

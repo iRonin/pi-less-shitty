@@ -29,7 +29,15 @@
       "packages/session-recall/src/session-recall.ts",
       "packages/session-title/src/index.ts",
       "packages/model-sort-fix/src/model-sort-fix.ts",
-      "packages/smart-compaction/src/smart-compaction.ts"
+      "packages/model-registry-fix/src/model-registry-fix.ts",
+      "packages/smart-compaction/src/smart-compaction.ts",
+      "packages/loop-detector/src/index.ts",
+      "packages/autocomplete-base-paths/src/index.ts"
     ]
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4"
   }
 }

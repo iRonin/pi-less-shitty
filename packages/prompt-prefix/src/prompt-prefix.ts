@@ -73,9 +73,6 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ── 1. Prepend prefix to user messages at display time ──────────────────
-	//
-	// Hook message_start to add the prefix for TUI rendering only. The prefix
-	// is never stored in the session and never sent to the LLM.
 
 	pi.on("message_start", (event) => {
 		if (!cfg.enabled) return;
@@ -89,7 +86,6 @@ export default function (pi: ExtensionAPI) {
 			if (!msg.content.trim()) return;
 			msg.content = `${prefix}${msg.content}`;
 		} else if (Array.isArray(msg.content)) {
-			// Find the first text block
 			for (const block of msg.content) {
 				if (block.type === "text" && typeof block.text === "string") {
 					if (block.text.trimStart().startsWith("/")) return;
@@ -102,9 +98,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── 2. Strip prefix before persistence ──────────────────────────────────
-	//
-	// Revert the display-only prefix so the session file stays clean.
-	// The TUI has already rendered the prefixed version by this point.
 
 	pi.on("message_end", (event) => {
 		if (!cfg.enabled) return;
@@ -128,10 +121,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── 3. Strip prefix from stored messages on session reload ──────────────
-	//
-	// When a session is reloaded, old messages that were stored with the prefix
-	// (before the message_start/message_end approach) need to be cleaned up
-	// before being sent to the LLM.
 
 	pi.on("context", (event) => {
 		if (!cfg.enabled) return;
@@ -179,11 +168,9 @@ export default function (pi: ExtensionAPI) {
 			"Use _ for spaces (pi trims trailing spaces). " +
 			"Note: 'on', 'off', 'reset' are reserved and cannot be used as prefix values.",
 		handler: async (args, ctx) => {
-			// Pi trims command args, so trailing spaces are lost. Use "_" as a space placeholder.
-			const arg = args.replace(/_/g, " "); // "CK❯_" → "CK❯ "
-			const cmd = arg.trim();               // trimmed copy for subcommand matching
+			const arg = args.replace(/_/g, " ");
+			const cmd = arg.trim();
 
-			// No args → show current state
 			if (!cmd) {
 				const state = cfg.enabled ? `"${cfg.prefix}"` : `"${cfg.prefix}" (disabled)`;
 				ctx.ui.notify(`Prompt prefix: ${state}  [display only — not sent to AI]`, "info");
@@ -211,7 +198,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Anything else → set as new prefix (use arg, not cmd, to keep trailing space)
 			if (arg.length > MAX_PREFIX_LENGTH) {
 				ctx.ui.notify(`Prefix too long (max ${MAX_PREFIX_LENGTH} characters)`, "error");
 				return;
