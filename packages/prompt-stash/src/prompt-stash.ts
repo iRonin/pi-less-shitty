@@ -204,7 +204,7 @@ export default function (pi: ExtensionAPI) {
       const theme = ctx.ui.theme;
       const count = theme.fg("accent", String(stashes.length));
       const auto = settings.autoStash ? theme.fg("accent", " ⚡") : "";
-      ctx.ui.setStatus("prompt-stash", `📫 ${count}${auto}`);
+      ctx.ui.setStatus("prompt-stash", `🗄️ ${count}${auto}`);
     }
   }
 
@@ -216,39 +216,101 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const items = stashes.map((s, i) => {
-      const idx = `[${i + 1}]`;
-      const when = formatTime(s.timestamp);
-      const preview = formatPreview(s.text, 55);
-      return `${idx} ${preview}  (${when})`;
-    });
+    while (stashes.length > 0) {
+      let deleteTriggered = false;
+      let highlightedIndex = 0;
+      let controller: AbortController | undefined;
 
-    const selected = await ctx.ui.select("Prompt Stashes", items);
-    if (!selected) return;
+      const buildItems = (): string[] => {
+        return stashes.map((s, i) => {
+          const prefix = i === highlightedIndex ? "▸ " : "  ";
+          const when = formatTime(s.timestamp);
+          const preview = formatPreview(s.text, 55);
+          return `${prefix}[${i + 1}] ${preview}  (${when})`;
+        });
+      };
 
-    const idx = items.indexOf(selected);
-    if (idx < 0) return;
+      const items = buildItems();
+      items.push(``);
+      items.push(`  ↑↓ navigate  ·  enter: select  ·  d: delete`);
 
-    const entry = stashes[idx];
-    const picked = await ctx.ui.select(`Stash ${idx + 1}: "${formatPreview(entry.text, 40)}"`, [
-      "Restore to editor",
-      "View full text",
-      "Delete",
-    ]);
+      const unsub = ctx.ui.onTerminalInput((data: string) => {
+        const UP = "\x1b[A";
+        const DOWN = "\x1b[B";
+        const CTRL_UP = "\x1b[1;5A";
+        const CTRL_DOWN = "\x1b[1;5B";
+        const dKey = data === "d" || data === "D";
 
-    if (picked === "Restore to editor") {
-      stashes.splice(idx, 1);
-      doSave();
-      updateStatus(ctx);
-      ctx.ui.setEditorText(entry.text);
-      ctx.ui.notify(`Stash ${idx + 1} restored`, "info");
-    } else if (picked === "View full text") {
-      await ctx.ui.editor("Stash (edit to update, confirm to save back)", entry.text);
-    } else if (picked === "Delete") {
-      stashes.splice(idx, 1);
-      doSave();
-      updateStatus(ctx);
-      ctx.ui.notify(`Stash ${idx + 1} deleted`, "info");
+        if (data === UP || data === CTRL_UP) {
+          highlightedIndex = highlightedIndex === 0 ? stashes.length - 1 : highlightedIndex - 1;
+          // Re-render picker with updated highlight
+          controller?.abort();
+          return { consume: true };
+        }
+        if (data === DOWN || data === CTRL_DOWN) {
+          highlightedIndex = highlightedIndex === stashes.length - 1 ? 0 : highlightedIndex + 1;
+          controller?.abort();
+          return { consume: true };
+        }
+        if (dKey) {
+          deleteTriggered = true;
+          controller?.abort();
+          return { consume: true };
+        }
+        return undefined;
+      });
+
+      controller = new AbortController();
+
+      let selected: string | undefined;
+      try {
+        selected = await ctx.ui.select("Prompt Stashes", items, { signal: controller.signal });
+      } catch {
+        // aborted by arrow/d handler
+      }
+      unsub();
+
+      if (deleteTriggered) {
+        const dropped = stashes.splice(highlightedIndex, 1)[0];
+        doSave();
+        updateStatus(ctx);
+        ctx.ui.notify(`Dropped stash ${highlightedIndex + 1}: "${formatPreview(dropped.text, 40)}"`, "info");
+        // Reset highlight after deletion
+        if (highlightedIndex >= stashes.length) {
+          highlightedIndex = Math.max(0, stashes.length - 1);
+        }
+        continue;
+      }
+
+      if (!selected) return;
+
+      // Strip hint lines from matching
+      const hintLines = 2;
+      const realItems = items.slice(0, items.length - hintLines);
+      const idx = realItems.indexOf(selected);
+      if (idx < 0) continue;
+
+      const entry = stashes[idx];
+      const picked = await ctx.ui.select(`Stash ${idx + 1}: "${formatPreview(entry.text, 40)}"`, [
+        "Restore to editor",
+        "View full text",
+        "Delete",
+      ]);
+
+      if (picked === "Restore to editor") {
+        stashes.splice(idx, 1);
+        doSave();
+        updateStatus(ctx);
+        ctx.ui.setEditorText(entry.text);
+        ctx.ui.notify(`Stash ${idx + 1} restored`, "info");
+      } else if (picked === "View full text") {
+        await ctx.ui.editor("Stash (edit to update, confirm to save back)", entry.text);
+      } else if (picked === "Delete") {
+        stashes.splice(idx, 1);
+        doSave();
+        updateStatus(ctx);
+        ctx.ui.notify(`Stash ${idx + 1} deleted`, "info");
+      }
     }
   }
 

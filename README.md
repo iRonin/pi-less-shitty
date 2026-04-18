@@ -50,6 +50,14 @@ cd ~/Work/Pi-Agent/pi-less-shitty
 # Install dependencies (pi will handle this via package.json pi manifest)
 ```
 
+## iTerm2 Prompt Navigation
+
+Each user prompt emits an iTerm2 mark (`OSC 1341;SetMark`). Navigate between your prompts:
+- **Cmd+Shift+Up** — previous prompt
+- **Cmd+Shift+Down** — next prompt
+
+Works in scrollback — marks persist as the conversation grows. Zero-width, no TUI interference.
+
 ## Dist Patches
 
 Applied to the installed pi package (`/opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent/dist/`).
@@ -62,7 +70,7 @@ bash scripts/apply-patches.sh
 | Patch | Description | Files |
 |-------|-------------|-------|
 | `autocomplete-base-paths` | Multi-directory `@` file autocomplete | `settings-manager.js`, `autocomplete.js`, `interactive-mode.js` |
-| `user-message-borders` | Yellow horizontal borders on user prompts + removes broken OSC133 shell integration markers that corrupt iTerm2 viewport | `user-message.js`, `assistant-message.js` |
+| `user-message-borders` | Yellow horizontal borders on user prompts + iTerm2 prompt marks (Cmd+Shift+Up/Down navigation) | `user-message.js`, `assistant-message.js` |
 
 ## License
 
