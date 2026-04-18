@@ -166,8 +166,8 @@ async function generateSmartSummary(
   customInstructions?: string,
   readFiles?: string[],
   modifiedFiles?: string[],
-): Promise<string | null> {
-  if (scoredFlat.length === 0) return null;
+): Promise<string> {
+  if (scoredFlat.length === 0) throw new Error("Smart compaction: no messages to summarize.");
 
   // Build full message list for the LLM — no truncation, every message intact
   const llmMessages = scoredFlat.map((m) => ({
@@ -196,12 +196,26 @@ async function generateSmartSummary(
 
   // Use configured scoring model first, fall back to the main session model
   let model = modelRegistry.find(settings.scoringProvider, settings.scoringModel);
+  let modelSource = `${settings.scoringProvider}:${settings.scoringModel}`;
   if (!model) {
-    model = modelRegistry.currentModel ?? modelRegistry.find(modelRegistry.defaultProvider, modelRegistry.defaultModel);
+    model = modelRegistry.currentModel;
+    modelSource = "currentModel";
   }
-  if (!model) return null;
+  if (!model) {
+    model = modelRegistry.find(modelRegistry.defaultProvider, modelRegistry.defaultModel);
+    modelSource = `default: ${modelRegistry.defaultProvider}/${modelRegistry.defaultModel}`;
+  }
+  if (!model) {
+    throw new Error(`Smart compaction: no model found for summarization. Tried: scoring model ${settings.scoringProvider}:${settings.scoringModel}, currentModel, and default ${modelRegistry.defaultProvider}/${modelRegistry.defaultModel}`);
+  }
+
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) return null;
+  if (!auth.ok) {
+    throw new Error(`Smart compaction: model auth failed (${modelSource}). ${auth.error ?? "no error details"}`);
+  }
+  if (!auth.apiKey) {
+    throw new Error(`Smart compaction: no API key for model ${modelSource}. Provider needs authentication.`);
+  }
 
   try {
     const response = await complete(
@@ -261,9 +275,13 @@ ${conversationText}
       .map((c: any) => c.text)
       .join("\n")
       .trim();
-    return text || null;
-  } catch {
-    return null;
+    if (!text) {
+      const types = response.content.map((c: any) => c?.type ?? "unknown").join(", ");
+      throw new Error(`Smart compaction: LLM returned no text content (model: ${modelSource}). Content types: [${types}]. Response: ${JSON.stringify(response.content).substring(0, 500)}`);
+    }
+    return text;
+  } catch (err: any) {
+    throw new Error(`Smart compaction: LLM summarization failed (model: ${modelSource}). ${err.message}`);
   }
 }
 
@@ -348,14 +366,6 @@ async function handleSmartCompaction(
     scoredFlat, loops, signal, ctx.modelRegistry, settings,
     previousSummary, customInstructions, readFiles, modifiedFiles,
   );
-
-  if (!summary) {
-    throw new Error(
-      `Smart compaction: LLM summarization failed. ` +
-      `Model ${settings.scoringProvider}:${settings.scoringModel} returned no summary. ` +
-      `Compaction aborted — no changes applied.`,
-    );
-  }
 
   if (isSplitTurn && turnPrefixMessages.length > 0) {
     summary += "\n\n> **Split turn note:** Earlier parts of this turn were summarized above. " +
