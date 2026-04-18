@@ -1,0 +1,23 @@
+{
+  "name": "@ironin/pi-content-filter",
+  "version": "1.0.0",
+  "description": "Content filter for pi prompts and tool results — sanitize profanity from user input, memories, and context",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ironin/pi-less-shitty"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/content-filter.ts"
+  },
+  "files": ["src/"],
+  "pi": {
+    "extensions": ["./src/content-filter.ts"]
+  },
+  "keywords": ["pi-package", "pi-coding-agent", "pi-extension", "content-filter"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

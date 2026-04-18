@@ -33,7 +33,8 @@
       "packages/smart-compaction/src/smart-compaction.ts",
       "packages/loop-detector/src/index.ts",
       "packages/autocomplete-base-paths/src/index.ts",
-      "packages/queue-emojis/src/index.ts"
+      "packages/queue-emojis/src/index.ts",
+      "packages/content-filter/src/content-filter.ts"
     ]
   },
   "devDependencies": {

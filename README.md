@@ -27,6 +27,7 @@ Vibed by my clanker. Use at your own risk. I test as I go.
 | `@ironin/pi-session-recall` | Session info on exit, /q, /resume-last, /sessions |
 | `@ironin/pi-session-title` | Auto-title sessions |
 | `@ironin/pi-smart-compaction` | Heuristic turn scoring for compaction instead of blanket LLM summary |
+| `@ironin/pi-content-filter` | Sanitizes profanity from prompts, memories, and tool results via wildcard patterns |
 
 ## Install
 
