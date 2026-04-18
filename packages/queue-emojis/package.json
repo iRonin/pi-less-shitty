@@ -1,0 +1,13 @@
+{
+  "name": "@ironin/pi-queue-emojis",
+  "version": "1.0.0",
+  "description": "Adds emojis to steer/follow-up queue display lines in the pi TUI",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "main": "src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ]
+}

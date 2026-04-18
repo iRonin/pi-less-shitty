@@ -223,14 +223,26 @@ export default function (pi: ExtensionAPI) {
       return `${idx} ${preview}  (${when})`;
     });
 
-    // Hint line at bottom
+    // Custom shortcuts bar (appends below picker, mimics pi's built-in footer)
     items.push("");
-    items.push("  d — quick delete by number");
+    items.push("  d delete  ·  ↑↓ navigate  ·  enter select  ·  esc cancel");
 
     let deleteRequested = false;
+    let highlightedIndex = 0;
     const controller = new AbortController();
 
     const unsub = ctx.ui.onTerminalInput((data: string) => {
+      const UP = "\x1b[A";
+      const DOWN = "\x1b[B";
+      // Mirror arrow keys to track highlight without consuming
+      if (data === UP) {
+        highlightedIndex = highlightedIndex === 0 ? stashes.length - 1 : highlightedIndex - 1;
+        return undefined; // let picker handle it too
+      }
+      if (data === DOWN) {
+        highlightedIndex = highlightedIndex === stashes.length - 1 ? 0 : highlightedIndex + 1;
+        return undefined; // let picker handle it too
+      }
       if (data === "d" || data === "D") {
         deleteRequested = true;
         controller.abort();
@@ -248,13 +260,16 @@ export default function (pi: ExtensionAPI) {
     unsub();
 
     if (deleteRequested) {
-      const numStr = await ctx.ui.input("Delete which stash? (number)");
-      const n = numStr ? parseInt(numStr, 10) : NaN;
-      if (!isNaN(n) && n >= 1 && n <= stashes.length) {
-        const dropped = stashes.splice(n - 1, 1)[0];
+      const entry = stashes[highlightedIndex];
+      const ok = await ctx.ui.confirm(
+        `Delete stash ${highlightedIndex + 1}?`,
+        `"${formatPreview(entry.text, 60)}"`
+      );
+      if (ok) {
+        stashes.splice(highlightedIndex, 1);
         doSave();
         updateStatus(ctx);
-        ctx.ui.notify(`Dropped stash ${n}: "${formatPreview(dropped.text, 40)}"`, "info");
+        ctx.ui.notify(`Dropped stash ${highlightedIndex + 1}`, "info");
       }
       return;
     }

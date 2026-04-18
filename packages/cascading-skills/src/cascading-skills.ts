@@ -283,6 +283,17 @@ function discoverSkills(cwd: string): string[] {
     addIfNotShadowed(s);
   }
 
+  // 4. Fallback skill from monorepo — only when no ancestor claims the name.
+  //    This replaces the old package.json "skills" field which was loaded by
+  //    the package-manager at highest priority and couldn't be shadowed.
+  const MONOREPO_SKILLS = [
+    // Path to the hindsight skill shipped with pi-less-shitty monorepo
+    path.join(HOME, "Work", "Pi-Agent", "pi-less-shitty", "packages", "hindsight", "skills", "hindsight"),
+  ];
+  for (const s of MONOREPO_SKILLS) {
+    addIfNotShadowed(s);
+  }
+
   return out;
 }
 
