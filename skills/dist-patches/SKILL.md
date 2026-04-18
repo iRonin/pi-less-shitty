@@ -81,6 +81,7 @@ export class UserMessageComponent extends Container {
 +            return lines;
 +        }
 +        const border = theme.fg("warning", "─".repeat(Math.max(1, width)));
++        lines.unshift(border);
 +        // iTerm2 mark on top border
 +        lines[0] = OSC133_A + lines[0];
 +        // Centered ● PROMPT marker in top border
