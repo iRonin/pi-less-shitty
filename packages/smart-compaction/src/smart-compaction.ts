@@ -161,6 +161,7 @@ async function generateSmartSummary(
   loops: RetryLoop[],
   signal: AbortSignal,
   modelRegistry: any,
+  model: any,
   settings: SmartCompactionSettings,
   previousSummary?: string,
   customInstructions?: string,
@@ -194,27 +195,11 @@ async function generateSmartSummary(
     ? `\n\nFiles read: ${readFiles?.join(", ") || "none"}\nFiles modified: ${modifiedFiles?.join(", ") || "none"}`
     : "";
 
-  // Use configured scoring model first, fall back to the main session model
-  let model = modelRegistry.find(settings.scoringProvider, settings.scoringModel);
-  let modelSource = `${settings.scoringProvider}:${settings.scoringModel}`;
-  if (!model) {
-    model = modelRegistry.currentModel;
-    modelSource = "currentModel";
-  }
-  if (!model) {
-    model = modelRegistry.find(modelRegistry.defaultProvider, modelRegistry.defaultModel);
-    modelSource = `default: ${modelRegistry.defaultProvider}/${modelRegistry.defaultModel}`;
-  }
-  if (!model) {
-    throw new Error(`Smart compaction: no model found for summarization. Tried: scoring model ${settings.scoringProvider}:${settings.scoringModel}, currentModel, and default ${modelRegistry.defaultProvider}/${modelRegistry.defaultModel}`);
-  }
-
+  // Use the model passed from handleSmartCompaction
+  const modelSource = `${model.provider}/${model.id}`;
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) {
-    throw new Error(`Smart compaction: model auth failed (${modelSource}). ${auth.error ?? "no error details"}`);
-  }
-  if (!auth.apiKey) {
-    throw new Error(`Smart compaction: no API key for model ${modelSource}. Provider needs authentication.`);
+  if (!auth.ok || !auth.apiKey) {
+    throw new Error(`Smart compaction: auth failed for ${modelSource}. ok=${auth.ok} error=${auth.error ?? "none"}`);
   }
 
   try {
@@ -328,7 +313,6 @@ async function handleSmartCompaction(
 
   if (flatMsgs.length < settings.skipUnderMessages) return;
 
-  ctx.ui.setWorkingMessage("Smart compaction: scoring turns…");
   const scored = await scoreAllMessages(
     flatMsgs,
     settings.keepThreshold,
@@ -360,10 +344,28 @@ async function handleSmartCompaction(
     classification: scored[i].classification,
   }));
 
-  // ONE LLM call — all messages, full content, no truncation
-  ctx.ui.setWorkingMessage("Smart compaction: generating continuation summary…");
-  const summary = await generateSmartSummary(
-    scoredFlat, loops, signal, ctx.modelRegistry, settings,
+  // Resolve the model to use for summarization
+  let model = ctx.model ?? modelRegistry.currentModel;
+  if (!model) {
+    const dp = modelRegistry.defaultProvider;
+    const dm = modelRegistry.defaultModel;
+    if (dp && dm) model = modelRegistry.find(dp, dm);
+  }
+  if (!model) {
+    const avail = modelRegistry.getAvailable?.() ?? [];
+    for (const m of avail) {
+      try {
+        const a = await modelRegistry.getApiKeyAndHeaders(m);
+        if (a.ok && a.apiKey) { model = m; break; }
+      } catch {}
+    }
+  }
+  if (!model) {
+    throw new Error("Smart compaction: no model available for summarization.");
+  }
+
+  let summary = await generateSmartSummary(
+    scoredFlat, loops, signal, ctx.modelRegistry, model, settings,
     previousSummary, customInstructions, readFiles, modifiedFiles,
   );
 
@@ -396,8 +398,9 @@ async function handleSmartCompaction(
   const scoringTag = scoringMethod === "llm"
     ? ` [${settings.scoringProvider}:${settings.scoringModel}]`
     : " [heuristic]";
+  const summarySize = summary.length > 2000 ? `${(summary.length / 1024).toFixed(0)}K chars` : `${summary.length} chars`;
   ctx.ui.notify(
-    `Smart compaction: ${flatMsgs.length} turns → ${highCount} HIGH + ${mediumCount} MEDIUM + ${lowCount} LOW | ~${(tokensSaved / 1000).toFixed(1)}K saved${scoringTag}`,
+    `Smart compaction: ${flatMsgs.length} turns → ${highCount} HIGH + ${mediumCount} MEDIUM + ${lowCount} LOW | ~${(tokensSaved / 1000).toFixed(1)}K saved | summary: ~${(summaryTokens / 1000).toFixed(1)}K tokens (${summarySize})${scoringTag}`,
     "info",
   );
 
