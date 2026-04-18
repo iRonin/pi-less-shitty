@@ -1,0 +1,19 @@
+{
+  "name": "@ironin/pi-model-sort-fix",
+  "version": "1.0.0",
+  "description": "Fix :variant sort order bug in model resolution — base models preferred over :free, :nitro, etc.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/model-sort-fix.ts"
+  },
+  "files": ["src/"],
+  "pi": {
+    "extensions": ["./src/model-sort-fix.ts"]
+  },
+  "keywords": ["pi-package", "pi-coding-agent", "pi-extension"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

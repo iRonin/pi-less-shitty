@@ -1,0 +1,19 @@
+{
+  "name": "@ironin/pi-model-registry-fix",
+  "version": "1.0.0",
+  "description": "Fix apiKey validation (#3043) and models.json wipe (#3044) in model registry",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "exports": {
+    ".": "./src/model-registry-fix.ts"
+  },
+  "files": ["src/"],
+  "pi": {
+    "extensions": ["./src/model-registry-fix.ts"]
+  },
+  "keywords": ["pi-package", "pi-coding-agent", "pi-extension"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

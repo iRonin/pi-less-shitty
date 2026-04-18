@@ -16,8 +16,9 @@ Vibed by my clanker. Use at your own risk. I test as I go.
 | `@ironin/pi-image-paste` | Clipboard image paste → sends image data to LLM instead of file path |
 | `@ironin/pi-prompt-prefix` | Visual-only prefix for user prompts in TUI |
 | `@ironin/pi-prompt-stash` | Ctrl+S stash/pop, Ctrl+Shift+S stash picker, per-CWD storage |
-| `@ironin/pi-read-full` | Read entire files with configurable cap (bypasses 50KB limit) |
 | `@ironin/pi-kilocode-model-fix` | Fixes custom-provider (kilocode, etc.) default model resolution at startup |
+| `@ironin/pi-model-sort-fix` | Fixes `:variant` sort order bug — base models preferred over `:free`, `:nitro`, etc. |
+| `@ironin/pi-read-full` | Read entire files with configurable cap (bypasses 50KB limit) |
 | `@ironin/pi-session-recall` | Session info on exit, /q, /resume-last, /sessions |
 | `@ironin/pi-session-title` | Auto-title sessions |
 | `@ironin/pi-smart-compaction` | Heuristic turn scoring for compaction instead of blanket LLM summary |

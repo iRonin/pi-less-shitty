@@ -28,6 +28,7 @@
       "packages/read-full/src/read-full.ts",
       "packages/session-recall/src/session-recall.ts",
       "packages/session-title/src/index.ts",
+      "packages/model-sort-fix/src/model-sort-fix.ts",
       "packages/smart-compaction/src/smart-compaction.ts"
     ]
   }
