@@ -50,30 +50,9 @@ cd ~/Work/Pi-Agent/pi-less-shitty
 # Install dependencies (pi will handle this via package.json pi manifest)
 ```
 
-## iTerm2 Prompt Navigation
-
-Each user prompt renders a yellow border with a centered **● PROMPT** marker.
-The border also emits `OSC 133;A` (iTerm2 shell integration prompt mark).
-
-**Cmd+Shift+Up/Down** — jump between prompts in scrollback.
-Requires iTerm2 Shell Integration enabled (Preferences → General → Shell Integration).
-
 ## Dist Patches
 
-Applied to the installed pi package (`/opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent/dist/`).
-
-Run after every `npm update @mariozechner/pi-coding-agent`:
-```bash
-bash scripts/apply-patches.sh
-```
-
-### Patch format
-
-Each patch directory contains a `.patch` file (unified diff) that `apply-patches.sh` applies with `patch --forward`.
-
-| Patch | Description | Target |
-|-------|-------------|--------|
-| `user-message-borders` | Yellow borders + `OSC 133;A` iTerm2 mark + `● PROMPT` center marker | `dist/modes/interactive/components/user-message.js` |
+After `npm update`, read `skills/dist-patches/SKILL.md`. It contains inline diffs and instructions for re-applying patches to the freshly installed dist files.
 
 ## License
 
