@@ -83,6 +83,13 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Don't override if the current model has auth configured — it was either
+    // explicitly chosen via --model or is a valid default for its provider.
+    // Only override when the current model is a true fallback (no auth).
+    if (ctx.model && ctx.modelRegistry.hasConfiguredAuth(ctx.model)) {
+      return;
+    }
+
     const allModels = ctx.modelRegistry.getAll();
     const resolved = findModel(allModels, config.provider, config.modelId);
     if (!resolved) return; // provider not registered or model not found
