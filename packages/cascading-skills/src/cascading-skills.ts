@@ -181,44 +181,46 @@ function processEntry(p: string, seen: Set<string>, out: string[]): void {
 // Main discovery
 // ---------------------------------------------------------------------------
 
+/** Extract the skill name from a SKILL.md file. Returns null on failure. */
+function extractSkillName(skillDir: string): string | null {
+  const skillMd = path.join(skillDir, "SKILL.md");
+  try {
+    const content = fs.readFileSync(skillMd, "utf-8");
+    // Parse YAML frontmatter: name: <value>
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m);
+    if (match) {
+      const nameMatch = match[1].match(/^name:\s*(.+)$/m);
+      if (nameMatch) return nameMatch[1].trim();
+    }
+    // Fallback: use directory basename
+    return path.basename(skillDir);
+  } catch {
+    return path.basename(skillDir);
+  }
+}
+
 /** Collect all cascading skill directories for a given CWD. */
 function discoverSkills(cwd: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
 
-  // — Global sources —
+  // — Per-ancestor sources FIRST (walk up from CWD to HOME) —
+  // Ancestor skills take priority over global/extension skills because
+  // they are closest to the project's CWD and contextually most relevant.
 
-  // 1. ~/.pi/agent/skills/  (pi's built-in global skill directory)
-  for (const s of collectSkillsDir(path.join(HOME, ".pi", "agent", "skills"))) {
-    addUnique(s, seen, out);
-  }
-
-  // 2. ~/.pi/agent/settings.json → skills array
-  const globalSettings = readJson(path.join(HOME, ".pi", "agent", "settings.json"));
-  if (globalSettings?.skills) {
-    for (const p of resolveSkillArray(globalSettings.skills, path.join(HOME, ".pi", "agent"))) {
-      processEntry(p, seen, out);
-    }
-  }
-
-  // 3. ~/.agents/skills/  (shared Agent Skills standard directory)
-  for (const s of collectSkillsDir(path.join(HOME, ".agents", "skills"))) {
-    addUnique(s, seen, out);
-  }
-
-  // — Per-ancestor sources (walk up from CWD to HOME) —
+  const ancestorSkillDirs: string[] = [];
 
   for (const parentDir of walkParents(cwd)) {
     // .pi/skills/  and  .pi/settings.json → skills
     const piDir = path.join(parentDir, ".pi");
     if (fs.existsSync(piDir) && fs.statSync(piDir).isDirectory()) {
       for (const s of collectSkillsDir(path.join(piDir, "skills"))) {
-        addUnique(s, seen, out);
+        ancestorSkillDirs.push(s);
       }
       const settings = readJson(path.join(piDir, "settings.json"));
       if (settings?.skills) {
         for (const p of resolveSkillArray(settings.skills, piDir)) {
-          processEntry(p, seen, out);
+          processEntry(p, seen, ancestorSkillDirs);
         }
       }
     }
@@ -226,8 +228,59 @@ function discoverSkills(cwd: string): string[] {
     // .agents/skills/  (shared Agent Skills standard directory)
     const agentsSkills = path.join(parentDir, ".agents", "skills");
     for (const s of collectSkillsDir(agentsSkills)) {
-      addUnique(s, seen, out);
+      ancestorSkillDirs.push(s);
     }
+  }
+
+  // Build the set of skill names claimed by ancestors
+  const ancestorSkillNames = new Set<string>();
+  for (const dir of ancestorSkillDirs) {
+    const name = extractSkillName(dir);
+    if (name) ancestorSkillNames.add(name);
+    addUnique(dir, seen, out);
+  }
+
+  // — Global sources (only if NOT shadowed by an ancestor skill) —
+
+  /** Add a single skill dir only if its name is not claimed by an ancestor. */
+  function addIfNotShadowed(skillDir: string): void {
+    const name = extractSkillName(skillDir);
+    if (name && ancestorSkillNames.has(name)) return; // ancestor owns this name
+    addUnique(skillDir, seen, out);
+  }
+
+  /** Process entries from a settings skills array, skipping ancestor-shadowed names. */
+  function processIfNotShadowed(skillArray: unknown, baseDir: string): void {
+    if (!Array.isArray(skillArray)) return;
+    for (const entry of skillArray) {
+      if (typeof entry !== "string") continue;
+      let p = entry === "~" ? HOME : entry.startsWith("~/") ? path.join(HOME, entry.slice(2)) : entry;
+      if (!path.isAbsolute(p)) p = path.resolve(baseDir, p);
+      const canon = safeRealpath(p);
+      if (!canon || !isUnder(canon, HOME)) continue;
+      // Resolve to actual skill dirs
+      const dirs: string[] = [];
+      processEntry(canon, new Set(), dirs);
+      for (const d of dirs) {
+        addIfNotShadowed(d);
+      }
+    }
+  }
+
+  // 1. ~/.pi/agent/skills/  (pi's built-in global skill directory)
+  for (const s of collectSkillsDir(path.join(HOME, ".pi", "agent", "skills"))) {
+    addIfNotShadowed(s);
+  }
+
+  // 2. ~/.pi/agent/settings.json → skills array
+  const globalSettings = readJson(path.join(HOME, ".pi", "agent", "settings.json"));
+  if (globalSettings?.skills) {
+    processIfNotShadowed(globalSettings.skills, path.join(HOME, ".pi", "agent"));
+  }
+
+  // 3. ~/.agents/skills/  (shared Agent Skills standard directory)
+  for (const s of collectSkillsDir(path.join(HOME, ".agents", "skills"))) {
+    addIfNotShadowed(s);
   }
 
   return out;

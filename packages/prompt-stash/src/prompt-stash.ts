@@ -203,9 +203,8 @@ export default function (pi: ExtensionAPI) {
     } else {
       const theme = ctx.ui.theme;
       const count = theme.fg("accent", String(stashes.length));
-      const label = theme.fg("dim", stashes.length === 1 ? " stash" : " stashes");
       const auto = settings.autoStash ? theme.fg("accent", " ⚡") : "";
-      ctx.ui.setStatus("prompt-stash", `stash: ${count}${label}${auto}`);
+      ctx.ui.setStatus("prompt-stash", `📫 ${count}${auto}`);
     }
   }
 

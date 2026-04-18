@@ -20,10 +20,13 @@ This extension re-discovers skills at startup/reload by walking up the directory
 
 | Priority | Source |
 |----------|--------|
-| 1 | `~/.pi/agent/skills/` — global skills directory |
-| 2 | `~/.pi/agent/settings.json` → `skills` — global skill array |
-| 3 | Every parent `.pi/skills/` — ancestor skill directories |
-| 4 | Every parent `.pi/settings.json` → `skills` — ancestor skill arrays |
+| 1 | Every parent `.pi/skills/` — ancestor skill directories (closest to CWD) |
+| 2 | Every parent `.pi/settings.json` → `skills` — ancestor skill arrays |
+| 3 | `~/.pi/agent/skills/` — global skills directory |
+| 4 | `~/.pi/agent/settings.json` → `skills` — global skill array |
+| 5 | `~/.agents/skills/` — shared Agent Skills standard directory |
+
+**Ancestor priority:** Skills discovered in ancestor `.pi/` directories take precedence over global skills. If an ancestor directory has a skill with the same `name` frontmatter as a global skill, the global version is excluded from the output. This ensures the project-local version always wins. |
 
 ## Installation
 
