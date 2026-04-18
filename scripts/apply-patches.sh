@@ -8,7 +8,7 @@ PI_DIR="/opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent"
 echo "=== Applying dist patches ==="
 
 # autocomplete-base-paths
-PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches/autocomplete-base-paths" && pwd)"
+PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches/autocomplete-base-paths" 2>/dev/null && pwd)" || true
 BACKUP_DIR="$PATCH_DIR/dist-backup"
 if [ -d "$BACKUP_DIR" ]; then
     cp -f "$BACKUP_DIR/settings-manager.js" \
@@ -25,7 +25,7 @@ if [ -d "$BACKUP_DIR" ]; then
 fi
 
 # user-message-borders
-BORDER_PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches/user-message-borders" && pwd)"
+BORDER_PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../patches/user-message-borders" 2>/dev/null && pwd)" || true
 BORDER_BACKUP_DIR="$BORDER_PATCH_DIR/dist-backup"
 if [ -d "$BORDER_BACKUP_DIR" ]; then
     cp -f "$BORDER_BACKUP_DIR/user-message.js" \
