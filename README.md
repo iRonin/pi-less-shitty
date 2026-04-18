@@ -52,12 +52,11 @@ cd ~/Work/Pi-Agent/pi-less-shitty
 
 ## iTerm2 Prompt Navigation
 
-Each user prompt emits `OSC 133;A` (shell integration prompt mark).
-iTerm2 **Cmd+Shift+Up/Down** jumps between your prompts in scrollback.
+Each user prompt renders a yellow border with a centered **● PROMPT** marker.
+The border also emits `OSC 133;A` (iTerm2 shell integration prompt mark).
 
+**Cmd+Shift+Up/Down** — jump between prompts in scrollback.
 Requires iTerm2 Shell Integration enabled (Preferences → General → Shell Integration).
-
-The mark is injected into the yellow top border of each user message — zero-width, no TUI interference.
 
 ## Dist Patches
 
@@ -68,10 +67,13 @@ Run after every `npm update @mariozechner/pi-coding-agent`:
 bash scripts/apply-patches.sh
 ```
 
-| Patch | Description | Files |
-|-------|-------------|-------|
-| `autocomplete-base-paths` | Multi-directory `@` file autocomplete | `settings-manager.js`, `autocomplete.js`, `interactive-mode.js` |
-| `user-message-borders` | Yellow horizontal borders + injects `OSC 133;A` iTerm2 prompt mark for Cmd+Shift+Up/Down navigation | `user-message.js`, `assistant-message.js` |
+### Patch format
+
+Each patch directory contains a `.patch` file (unified diff) that `apply-patches.sh` applies with `patch --forward`.
+
+| Patch | Description | Target |
+|-------|-------------|--------|
+| `user-message-borders` | Yellow borders + `OSC 133;A` iTerm2 mark + `● PROMPT` center marker | `dist/modes/interactive/components/user-message.js` |
 
 ## License
 
