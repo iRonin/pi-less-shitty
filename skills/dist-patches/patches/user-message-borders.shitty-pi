@@ -27,7 +27,7 @@ render(width) {
     } else {
         markedBorder = fullBorder;
     }
-    lines.unshift(theme.fg("warning", OSC133_A + markedBorder));
+    lines.unshift(OSC133_A + theme.fg("warning", markedBorder));
     lines.push(theme.fg("warning", fullBorder));
     return lines;
 }
