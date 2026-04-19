@@ -399,10 +399,7 @@ async function handleSmartCompaction(
     ? ` [${settings.scoringProvider}:${settings.scoringModel}]`
     : " [heuristic]";
   const summarySize = summary.length > 2000 ? `${(summary.length / 1024).toFixed(0)}K chars` : `${summary.length} chars`;
-  ctx.ui.notify(
-    `Smart compaction: ${flatMsgs.length} turns → ${highCount} HIGH + ${mediumCount} MEDIUM + ${lowCount} LOW | ~${(tokensSaved / 1000).toFixed(1)}K saved | summary: ~${(summaryTokens / 1000).toFixed(1)}K tokens (${summarySize})${scoringTag}`,
-    "info",
-  );
+  const notificationText = `Smart compaction: ${flatMsgs.length} turns → ${highCount} HIGH + ${mediumCount} MEDIUM + ${lowCount} LOW | ~${(tokensSaved / 1000).toFixed(1)}K saved | summary: ~${(summaryTokens / 1000).toFixed(1)}K tokens (${summarySize})${scoringTag}`;
 
   // Store snapshot for analysis
   const snapshot = buildCompactionSnapshot({
@@ -433,6 +430,7 @@ async function handleSmartCompaction(
 
   return {
     compaction: { summary, firstKeptEntryId, tokensBefore, details: stats },
+    _notification: notificationText,
   };
 }
 
@@ -920,6 +918,7 @@ async function cmdDry(ctx: any, settings: SmartCompactionSettings) {
 
 export default function (pi: ExtensionAPI) {
   const settings = loadSettings();
+  let lastNotification: string | null = null;
 
   // Register CLI flag for offline session analysis
   pi.registerFlag("smart-compress", {
@@ -929,14 +928,23 @@ export default function (pi: ExtensionAPI) {
 
   // Intercepts ALL compaction: auto-trigger + /compact
   pi.on("session_before_compact", async (event, ctx) => {
-    ctx.ui.setStatus("smart-compaction", `smart: ${settings.scoringModel} keep≥${settings.keepThreshold}`);
+    ctx.ui.setStatus("smart-compaction", `🗜️ ${settings.scoringModel} k≥${settings.keepThreshold}`);
     const result = await handleSmartCompaction(event, ctx, settings);
+    lastNotification = (result as any)?._notification ?? null;
     ctx.ui.setStatus("smart-compaction", undefined);
     return result;
   });
 
+  // Show our stats notification AFTER pi's built-in compaction message
+  pi.on("session_compact", (_event, ctx) => {
+    if (lastNotification) {
+      ctx.ui.notify(lastNotification, "info");
+      lastNotification = null;
+    }
+  });
+
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("smart-compaction", `smart: ${settings.scoringModel} keep≥${settings.keepThreshold}`);
+    ctx.ui.setStatus("smart-compaction", `🗜️ ${settings.scoringModel} k≥${settings.keepThreshold}`);
 
     // Handle --smart-compress flag
     const flagValue = pi.getFlag("smart-compress") as string | undefined;

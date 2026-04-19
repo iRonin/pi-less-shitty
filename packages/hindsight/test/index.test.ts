@@ -1079,3 +1079,131 @@ describe("getStripPatterns", () => {
     assert.ok(patterns[1].source.includes("at .*"));
   });
 });
+
+// ─── resolveConfig child-wins tests ────────────────────────────────────────
+
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin, dirname as pathDirname } from "node:path";
+
+function writeHindsightConfig(dir: string, content: string) {
+  const hindsightDir = pathJoin(dir, ".hindsight");
+  mkdirSync(hindsightDir, { recursive: true });
+  writeFileSync(pathJoin(hindsightDir, "config.toml"), content);
+}
+
+function parseTomlTest(filePath: string): Record<string, string> {
+  if (!existsSync(filePath)) return {};
+  const raw = readFileSync(filePath, "utf-8");
+  const out: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*["']?(.*?)["']?\s*$/);
+    if (m) out[m[1]] = m[2];
+  }
+  return out;
+}
+
+function resolveConfigFixed(cwd: string): ResolvedConfig | null {
+  const configs: Record<string, string>[] = [];
+
+  let dir = cwd;
+  while (true) {
+    const cfgPath = pathJoin(dir, ".hindsight", "config.toml");
+    if (existsSync(cfgPath)) configs.push(parseTomlTest(cfgPath));
+    const parent = pathDirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  configs.reverse();
+
+  const merged: Record<string, string> = {};
+  for (const cfg of configs) Object.assign(merged, cfg);
+
+  return {
+    api_url: merged.api_url || "http://localhost:8888",
+    api_key: merged.api_key || "",
+    bank_id: merged.bank_id || null,
+    global_bank: merged.global_bank || null,
+    recall_types: merged.recall_types
+      ? merged.recall_types.split(",").map(t => t.trim()).filter(Boolean)
+      : ["observation"],
+    strip_patterns: merged.strip_patterns
+      ? merged.strip_patterns.split(",").map(p => p.trim()).filter(Boolean)
+      : [],
+  };
+}
+
+describe("resolveConfig child-wins", () => {
+  test("child bank_id wins over parent bank_id", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-config-"));
+    try {
+      const child = pathJoin(dir, "child");
+      mkdirSync(child, { recursive: true });
+
+      writeHindsightConfig(dir, 'bank_id = "legal-main"\nglobal_bank = "legal-all"');
+      writeHindsightConfig(child, 'bank_id = "legal-tools"');
+
+      const result = resolveConfigFixed(child);
+      assert.equal(result?.bank_id, "legal-tools", "child bank_id should win");
+      assert.equal(result?.global_bank, "legal-all", "parent global_bank should be inherited");
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("child global_bank overrides parent global_bank", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-config-"));
+    try {
+      const child = pathJoin(dir, "child");
+      mkdirSync(child, { recursive: true });
+
+      writeHindsightConfig(dir, 'bank_id = "test"\nglobal_bank = "pool-A"');
+      writeHindsightConfig(child, 'bank_id = "child"\nglobal_bank = "pool-B"');
+
+      const result = resolveConfigFixed(child);
+      assert.equal(result?.bank_id, "child");
+      assert.equal(result?.global_bank, "pool-B", "child global_bank should win");
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("child inherits parent global_bank when child has no global_bank", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-config-"));
+    try {
+      const child = pathJoin(dir, "child");
+      mkdirSync(child, { recursive: true });
+
+      writeHindsightConfig(dir, 'bank_id = "main"\nglobal_bank = "shared-all"');
+      writeHindsightConfig(child, 'bank_id = "child-project"');
+
+      const result = resolveConfigFixed(child);
+      assert.equal(result?.bank_id, "child-project");
+      assert.equal(result?.global_bank, "shared-all");
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("no config → null bank_id, null global_bank", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-config-"));
+    try {
+      const result = resolveConfigFixed(dir);
+      assert.equal(result?.bank_id, null);
+      assert.equal(result?.global_bank, null);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+
+  test("only root config: works for both root and deep subdir", () => {
+    const dir = mkdtempSync(pathJoin(tmpdir(), "hindsight-config-"));
+    try {
+      const sub = pathJoin(dir, "subdir", "deep");
+      mkdirSync(sub, { recursive: true });
+
+      writeHindsightConfig(dir, 'bank_id = "root-project"\nglobal_bank = "root-global"');
+
+      const rootResult = resolveConfigFixed(dir);
+      assert.equal(rootResult?.bank_id, "root-project");
+      assert.equal(rootResult?.global_bank, "root-global");
+
+      const deepResult = resolveConfigFixed(sub);
+      assert.equal(deepResult?.bank_id, "root-project");
+      assert.equal(deepResult?.global_bank, "root-global");
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+});

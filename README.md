@@ -40,6 +40,7 @@ After `npm update`, read `skills/dist-patches/SKILL.md`. It contains `.shitty-pi
 |-------|--------|---------|
 | `user-message-borders` | `dist/modes/interactive/components/user-message.js` | Yellow borders + `OSC 133;A` iTerm2 mark + `● PROMPT` center marker |
 | `clipboard-image-rendering` | `dist/modes/interactive/interactive-mode.js` | Render pasted clipboard images inline after user prompts |
+| `anthropic-tool-parameters` | `node_modules/@mariozechner/pi-ai/dist/providers/anthropic.js` | Fix crash when tools lack `parameters` schema (`tool.parameters ?? {}`) |
 
 ## Settings
 

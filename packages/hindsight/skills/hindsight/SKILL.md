@@ -11,7 +11,7 @@ Persistent memory for Pi sessions. Memories survive compaction and session resta
 
 - **Auto-recall**: Before each turn, relevant memories injected from project + global banks
 - **Auto-retain**: After each turn, conversation saved to project bank (delta-only)
-- **Manual tools**: `hindsight_recall`, `hindsight_retain`, `hindsight_reflect`
+- **Manual tools**: `hindsight_recall`, `hindsight_retain`, `hindsight_reflect`, `hindsight_promote`
 
 ## When to Use Tools
 
@@ -20,6 +20,25 @@ Persistent memory for Pi sessions. Memories survive compaction and session resta
 | `hindsight_retain` | Turn contains insight worth remembering beyond this session |
 | `hindsight_recall` | Working on unfamiliar code, need historical context |
 | `hindsight_reflect` | Need to synthesize patterns across multiple past sessions |
+| `hindsight_promote` | After a session — copy cross-project knowledge to global bank |
+
+### Cross-Bank Access
+
+Tools support explicit `bank` and `banks` parameters to query or write to any bank by name:
+
+```typescript
+// Query another project's memories
+hindsight_recall(query="build system setup", bank="project-Hermes")
+
+// Query multiple banks
+hindsight_recall(query="auth patterns", banks=["project-Pi-Agent", "project-Hermes", "work-all"])
+
+// Write directly to a specific bank
+hindsight_retain(content="Use jiti for TypeScript extension loading", bank="project-Hermes")
+
+// Copy memories between any two banks
+hindsight_promote(query="tool preferences", from="project-Pi-Agent", to="work-all")
+```
 
 ## Auto-retain vs Manual
 
@@ -29,10 +48,10 @@ Persistent memory for Pi sessions. Memories survive compaction and session resta
 
 | Scope | Use for | Examples |
 |---|---|---|
-| `project` | Project-specific knowledge | "We use Zustand, not Redux", "API key is in env, not config", "Fixed CORS by adding /api proxy" |
-| `global` | Cross-project knowledge | "Always run `npm run build` first to check cascading errors", "OpenRouter rate limits at 60 req/min", "Pi extensions load via jiti, no compile step needed" |
+| `project` | Project-specific knowledge | "We use Zustand, not Redux", "API key is in env, not config" |
+| `global` | Cross-project knowledge | "Always run `npm run build` first", "OpenRouter rate limits at 60 req/min" |
 
-**Default scope is `project`**. Only use `global` when the insight genuinely applies across multiple projects in the same domain (Work or Legal).
+**Default scope is `project`**. Only use `global` when the insight genuinely applies across multiple projects.
 
 ## When NOT to Use
 

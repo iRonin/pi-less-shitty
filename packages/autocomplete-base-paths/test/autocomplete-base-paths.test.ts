@@ -242,6 +242,38 @@ describe("fd fuzzy search with spaces and case-insensitive", { skip: !fdPath }, 
 		assert.ok(found, "should find ECSC CPR 2023.md with case-insensitive @cpr");
 	});
 
+	it("fuzzy-matches file with spaces via @ECSCCPR (no spaces in query)", () => {
+		const spaceDir = join(rootDir, "My Project With Spaces", "Sub Dir");
+		const baseDir = join(rootDir, "My Project With Spaces");
+		mkdirSync(spaceDir, { recursive: true });
+
+		writeFile(join(baseDir, "ECSC CPR 2023.md"), "content");
+		writeFile(join(baseDir, "ECSC Rules.pdf"), "content");
+		writeFile(join(baseDir, "random.txt"), "content");
+
+		writeFile(join(baseDir, ".pi", "settings.json"), JSON.stringify({
+			autocompleteBasePaths: [baseDir],
+		}));
+
+		const collectedPaths = collectAutocompleteBasePaths(spaceDir);
+		assert.ok(collectedPaths.includes(baseDir));
+
+		// Simulate what buildFdQueryRegex does: E.*C.*S.*C.*C.*P.*R
+		const fuzzyPattern = "ECSCCPR".split("").map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+
+		const out = spawnSync(fdPath!, [
+			"--base-directory", baseDir,
+			"--max-results", "20",
+			"--type", "f",
+			"--full-path", "--ignore-case", "--regex",
+			"--exclude", ".git",
+			fuzzyPattern,
+		], { encoding: "utf-8" });
+
+		assert.ok(out.stdout.includes("ECSC CPR 2023.md"), "should fuzzy-match ECSC CPR 2023.md with @ECSCCPR");
+		assert.ok(!out.stdout.includes("random.txt"), "should NOT match unrelated files");
+	});
+
 	it("handles spaces in paths", () => {
 		const spaceDir = join(rootDir, "My Project With Spaces", "Sub Dir");
 		const baseDir = join(rootDir, "My Project With Spaces");

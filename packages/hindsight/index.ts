@@ -66,16 +66,26 @@ function parseToml(filePath: string): Record<string, string> {
 
 function resolveConfig(cwd: string): ResolvedConfig | null {
   try {
-    const merged: Record<string, string> = {};
-    Object.assign(merged, parseToml(join(homedir(), ".hindsight", "config.toml")));
+    // Collect configs from cwd → root, then reverse to get root → leaf
+    // so child configs overwrite parent ones (child wins)
+    const configs: Record<string, string>[] = [];
 
     let dir = cwd;
     while (true) {
-      Object.assign(merged, parseToml(join(dir, ".hindsight", "config.toml")));
+      const cfg = parseToml(join(dir, ".hindsight", "config.toml"));
+      if (Object.keys(cfg).length) configs.push(cfg);
       const parent = dirname(dir);
       if (parent === dir) break;
       dir = parent;
     }
+
+    configs.reverse();
+    // User-wide config is the lowest priority (prepended before reversed list)
+    const userCfg = parseToml(join(homedir(), ".hindsight", "config.toml"));
+    if (Object.keys(userCfg).length) configs.unshift(userCfg);
+
+    const merged: Record<string, string> = {};
+    for (const cfg of configs) Object.assign(merged, cfg);
 
     return {
       api_url: merged.api_url || "http://localhost:8888",
@@ -279,18 +289,23 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     name: "hindsight_recall",
     label: "Hindsight Recall",
     description: "Pull relevant context, conventions, or past decisions from project memory.",
-    parameters: Type.Object({ query: Type.String({ description: "What to search for" }) }),
+    parameters: Type.Object({
+      query: Type.String({ description: "What to search for" }),
+      bank: Type.Optional(Type.String({ description: "Specific bank to query (e.g. 'legal-sewage', 'project-Pi-Agent'). Defaults to project + global banks." })),
+      banks: Type.Optional(Type.Array(Type.String(), { description: "Multiple banks to query simultaneously." })),
+    }),
     async execute(_id, params) {
       const config = resolveConfig(process.cwd());
       if (!config?.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
-      const banks = getRecallBanks(config);
-      if (!banks.length) return { content: [{ type: "text" as const, text: "No bank_id configured." }], details: {}, isError: true };
+      const p = params as any;
+      const banks = p.bank ? [p.bank] : p.banks?.length ? p.banks : getRecallBanks(config);
+      if (!banks.length) return { content: [{ type: "text" as const, text: "No banks configured." }], details: {}, isError: true };
       try {
         const results = await Promise.all(banks.map(async (bank) => {
           const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
             method: "POST",
             headers: { "Content-Type": "application/json", ...authHeader(config.api_key) },
-            body: JSON.stringify({ query: params.query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types }),
+            body: JSON.stringify({ query: p.query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types }),
           });
           if (!res.ok) return [];
           const data = await res.json();
@@ -298,8 +313,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         }));
         const flat = results.flat();
         return flat.length
-          ? { content: [{ type: "text" as const, text: flat.join("\n\n") }], details: {} }
-          : { content: [{ type: "text" as const, text: "No memories found." }], details: {} };
+          ? { content: [{ type: "text" as const, text: flat.join("\n\n") }], details: { banks: banks.join(", "), count: flat.length } }
+          : { content: [{ type: "text" as const, text: "No memories found." }], details: { banks: banks.join(", ") } };
       } catch (e) {
         return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
       }
@@ -315,12 +330,13 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("global")], {
         description: "Use 'project' for project-specific knowledge (decisions, bugs, patterns). Use 'global' for cross-project knowledge: coding conventions, tool preferences, environment setup, architecture patterns, or lessons learned that apply to other projects. When in doubt, use 'project'.",
       })),
+      bank: Type.Optional(Type.String({ description: "Explicit bank name to write to (e.g. 'legal-ramod', 'project-Hermes'). Overrides scope." })),
     }),
     async execute(_id, params) {
       const config = resolveConfig(process.cwd());
       if (!config?.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
-      const scope = (params as any).scope || "project";
-      const bank = scope === "global" && config.global_bank ? config.global_bank : getActiveBank(config);
+      const p = params as any;
+      const bank = p.bank || (p.scope === "global" && config.global_bank ? config.global_bank : getActiveBank(config));
       if (!bank) return { content: [{ type: "text" as const, text: "No bank_id configured." }], details: {}, isError: true };
       try {
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
@@ -332,7 +348,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           }),
         });
         return res.ok
-          ? { content: [{ type: "text" as const, text: `Memory retained → ${bank}.` }], details: { bank, scope } }
+          ? { content: [{ type: "text" as const, text: `Memory retained → ${bank}.` }], details: { bank, scope: p.bank ? "explicit" : (p.scope || "project") } }
           : { content: [{ type: "text" as const, text: `Failed to retain to ${bank}.` }], details: {}, isError: true };
       } catch (e) {
         return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
@@ -361,6 +377,62 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: data.synthesis || JSON.stringify(data) }], details: {} };
         }
         return { content: [{ type: "text" as const, text: "Reflection failed." }], details: {}, isError: true };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "hindsight_promote",
+    label: "Hindsight Promote Memories",
+    description: "Copy memories between banks. Use to analyze what knowledge from one claim applies to another — recall from the source bank, copy matching memories to the target bank. Use case: 'analyze what memories from claim 0506 could be applicable to claim 0100 and add them there'.",
+    parameters: Type.Object({
+      query: Type.String({ description: "What to search for in the source bank (e.g. 'drafting conventions', 'procedural rules', 'ECSC formatting')" }),
+      from: Type.Optional(Type.String({ description: "Source bank ID. Defaults to the active project bank." })),
+      to: Type.Optional(Type.String({ description: "Target bank ID. Defaults to the global bank." })),
+    }),
+    async execute(_id, params) {
+      const config = resolveConfig(process.cwd());
+      if (!config?.api_url) return { content: [{ type: "text" as const, text: "Hindsight not configured." }], details: {}, isError: true };
+      const p = params as any;
+      const fromBank = p.from || getActiveBank(config);
+      const toBank = p.to || config.global_bank;
+      if (!fromBank) return { content: [{ type: "text" as const, text: "No source bank (no bank_id configured, and no 'from' specified)." }], details: {}, isError: true };
+      if (!toBank) return { content: [{ type: "text" as const, text: "No target bank (no global_bank configured, and no 'to' specified)." }], details: {}, isError: true };
+      try {
+        // Recall from source bank
+        const res = await fetch(`${config.api_url}/v1/default/banks/${fromBank}/memories/recall`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeader(config.api_key) },
+          body: JSON.stringify({ query: p.query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types }),
+        });
+        if (!res.ok) return { content: [{ type: "text" as const, text: `Recall from ${fromBank} failed (HTTP ${res.status}).` }], details: {}, isError: true };
+        const data = await res.json();
+        const memories = data.results || [];
+        if (!memories.length) return { content: [{ type: "text" as const, text: `No memories in ${fromBank} matching \"${p.query}\".` }], details: {} };
+
+        // Copy each memory to target bank
+        const promoted: string[] = [];
+        for (const mem of memories) {
+          const copyRes = await fetch(`${config.api_url}/v1/default/banks/${toBank}/memories`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...authHeader(config.api_key) },
+            body: JSON.stringify({
+              items: [{ content: mem.text, context: `pi: promoted from ${fromBank}`, timestamp: new Date().toISOString(), tags: [...(mem.tags || []), "promoted"] }],
+              async: false,
+            }),
+          });
+          if (copyRes.ok) promoted.push(mem.text.slice(0, 100));
+        }
+
+        if (promoted.length) {
+          return {
+            content: [{ type: "text" as const, text: `Promoted ${promoted.length} memories from ${fromBank} → ${toBank}:\n\n${promoted.map((m: string) => `• ${m}...`).join("\n")}` }],
+            details: { count: promoted.length, from: fromBank, to: toBank },
+          };
+        }
+        return { content: [{ type: "text" as const, text: `Found ${memories.length} memories but failed to copy to ${toBank}.` }], details: {}, isError: true };
       } catch (e) {
         return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
       }

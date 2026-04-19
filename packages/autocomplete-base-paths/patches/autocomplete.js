@@ -10,10 +10,17 @@ function toDisplayPath(value) {
 function escapeRegex(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+function buildFdQueryRegex(query) {
+    const normalized = toDisplayPath(query);
+    return normalized
+        .split("")
+        .map((char) => escapeRegex(char))
+        .join(".*");
+}
 function buildFdPathQuery(query) {
     const normalized = toDisplayPath(query);
     if (!normalized.includes("/")) {
-        return normalized;
+        return buildFdQueryRegex(normalized);
     }
     const hasTrailingSeparator = normalized.endsWith("/");
     const trimmed = normalized.replace(/^\/+|\/+$/g, "");
@@ -118,6 +125,7 @@ async function walkDirectoryWithFd(baseDir, fdPath, query, maxResults, signal) {
         ".git/**",
     ];
     if (query) {
+        args.push("--regex");
         args.push(buildFdPathQuery(query));
     }
     return await new Promise((resolve) => {
@@ -567,6 +575,15 @@ export class CombinedAutocompleteProvider {
         // Substring match in full path
         else if (filePath.toLowerCase().includes(lowerQuery))
             score = 30;
+        // Fuzzy char-by-char match in filename
+        else {
+            let fi = 0;
+            for (let qi = 0; qi < lowerQuery.length && fi < lowerFileName.length; qi += 1) {
+                const qc = lowerQuery[qi];
+                while (fi < lowerFileName.length && lowerFileName[fi] !== qc) fi += 1;
+                if (fi < lowerFileName.length) { score += 5; fi += 1; }
+            }
+        }
         // Directories get a bonus to appear first
         if (isDirectory && score > 0)
             score += 10;

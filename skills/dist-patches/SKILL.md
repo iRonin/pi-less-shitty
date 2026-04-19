@@ -12,6 +12,8 @@ After every `npm update @mariozechner/pi-coding-agent`, re-apply them.
 ## How to Apply
 
 For each `.shitty-pi` file in `patches/`:
+
+> **Note:** Most patches target `dist/` under the pi-coding-agent package. The `anthropic-tool-parameters` patch targets `node_modules/@mariozechner/pi-ai/dist/` (a transitive dependency). Both live under `/opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent/`.
 1. Read the patch file — it describes the target, purpose, and exact code to inject
 2. Read the current upstream file at the target path
 3. Apply the changes described in the patch file
@@ -23,6 +25,7 @@ For each `.shitty-pi` file in `patches/`:
 |-------|--------|---------|
 | `user-message-borders` | `dist/modes/interactive/components/user-message.js` | Yellow borders + OSC 133;A iTerm2 mark + ● PROMPT marker |
 | `clipboard-image-rendering` | `dist/modes/interactive/interactive-mode.js` | Render pasted clipboard images inline after user prompts |
+| `anthropic-tool-parameters` | `node_modules/@mariozechner/pi-ai/dist/providers/anthropic.js` | Fix `Cannot read properties of undefined (reading 'properties')` crash on tools without parameter schemas |
 
 ## How to Add a New Patch
 

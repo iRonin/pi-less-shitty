@@ -216,91 +216,93 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const items = stashes.map((s, i) => {
-      const idx = `[${i + 1}]`;
-      const when = formatTime(s.timestamp);
-      const preview = formatPreview(s.text, 55);
-      return `${idx} ${preview}  (${when})`;
-    });
+    while (stashes.length > 0) {
+      const items = stashes.map((s, i) => {
+        const idx = `[${i + 1}]`;
+        const when = formatTime(s.timestamp);
+        const preview = formatPreview(s.text, 55);
+        return `${idx} ${preview}  (${when})`;
+      });
 
-    // Custom shortcuts bar (appends below picker, mimics pi's built-in footer)
-    items.push("");
-    items.push("  d delete  ·  ↑↓ navigate  ·  enter select  ·  esc cancel");
+      items.push("");
+      items.push("  d delete  ·  ↑↓ navigate  ·  enter select  ·  esc cancel");
 
-    let deleteRequested = false;
-    let highlightedIndex = 0;
-    const controller = new AbortController();
+      let deleteRequested = false;
+      let highlightedIndex = 0;
+      const controller = new AbortController();
 
-    const unsub = ctx.ui.onTerminalInput((data: string) => {
-      const UP = "\x1b[A";
-      const DOWN = "\x1b[B";
-      // Mirror arrow keys to track highlight without consuming
-      if (data === UP) {
-        highlightedIndex = highlightedIndex === 0 ? stashes.length - 1 : highlightedIndex - 1;
-        return undefined; // let picker handle it too
+      const unsub = ctx.ui.onTerminalInput((data: string) => {
+        const UP = "\x1b[A";
+        const DOWN = "\x1b[B";
+        if (data === UP) {
+          highlightedIndex = highlightedIndex === 0 ? stashes.length - 1 : highlightedIndex - 1;
+          return undefined;
+        }
+        if (data === DOWN) {
+          highlightedIndex = highlightedIndex === stashes.length - 1 ? 0 : highlightedIndex + 1;
+          return undefined;
+        }
+        if (data === "d" || data === "D") {
+          deleteRequested = true;
+          controller.abort();
+          return { consume: true };
+        }
+        return undefined;
+      });
+
+      let selected: string | undefined;
+      try {
+        selected = await ctx.ui.select("Prompt Stashes", items, { signal: controller.signal });
+      } catch {
+        // aborted
       }
-      if (data === DOWN) {
-        highlightedIndex = highlightedIndex === stashes.length - 1 ? 0 : highlightedIndex + 1;
-        return undefined; // let picker handle it too
-      }
-      if (data === "d" || data === "D") {
-        deleteRequested = true;
-        controller.abort();
-        return { consume: true };
-      }
-      return undefined;
-    });
+      unsub();
 
-    let selected: string | undefined;
-    try {
-      selected = await ctx.ui.select("Prompt Stashes", items, { signal: controller.signal });
-    } catch {
-      // aborted
-    }
-    unsub();
+      if (deleteRequested) {
+        const entry = stashes[highlightedIndex];
+        const ok = await ctx.ui.confirm(
+          `Delete stash ${highlightedIndex + 1}?`,
+          `"${formatPreview(entry.text, 60)}"`
+        );
+        if (ok) {
+          stashes.splice(highlightedIndex, 1);
+          doSave();
+          updateStatus(ctx);
+          ctx.ui.notify(`Dropped stash ${highlightedIndex + 1}`, "info");
+        }
+        // Refresh highlight
+        if (highlightedIndex >= stashes.length) {
+          highlightedIndex = Math.max(0, stashes.length - 1);
+        }
+        continue; // re-open picker with refreshed list
+      }
 
-    if (deleteRequested) {
-      const entry = stashes[highlightedIndex];
-      const ok = await ctx.ui.confirm(
-        `Delete stash ${highlightedIndex + 1}?`,
-        `"${formatPreview(entry.text, 60)}"`
-      );
-      if (ok) {
-        stashes.splice(highlightedIndex, 1);
+      if (!selected) return; // esc/cancel — close picker
+
+      const realItems = items.slice(0, items.length - 2);
+      const idx = realItems.indexOf(selected);
+      if (idx < 0) return;
+
+      const entry = stashes[idx];
+      const picked = await ctx.ui.select(`Stash ${idx + 1}: "${formatPreview(entry.text, 40)}"`, [
+        "Restore to editor",
+        "View full text",
+        "Delete",
+      ]);
+
+      if (picked === "Restore to editor") {
+        stashes.splice(idx, 1);
         doSave();
         updateStatus(ctx);
-        ctx.ui.notify(`Dropped stash ${highlightedIndex + 1}`, "info");
+        ctx.ui.setEditorText(entry.text);
+        ctx.ui.notify(`Stash ${idx + 1} restored`, "info");
+      } else if (picked === "View full text") {
+        await ctx.ui.editor("Stash (edit to update, confirm to save back)", entry.text);
+      } else if (picked === "Delete") {
+        stashes.splice(idx, 1);
+        doSave();
+        updateStatus(ctx);
       }
-      return;
-    }
-
-    if (!selected) return;
-
-    // Strip hint lines from matching
-    const realItems = items.slice(0, items.length - 2);
-    const idx = realItems.indexOf(selected);
-    if (idx < 0) return;
-
-    const entry = stashes[idx];
-    const picked = await ctx.ui.select(`Stash ${idx + 1}: "${formatPreview(entry.text, 40)}"`, [
-      "Restore to editor",
-      "View full text",
-      "Delete",
-    ]);
-
-    if (picked === "Restore to editor") {
-      stashes.splice(idx, 1);
-      doSave();
-      updateStatus(ctx);
-      ctx.ui.setEditorText(entry.text);
-      ctx.ui.notify(`Stash ${idx + 1} restored`, "info");
-    } else if (picked === "View full text") {
-      await ctx.ui.editor("Stash (edit to update, confirm to save back)", entry.text);
-    } else if (picked === "Delete") {
-      stashes.splice(idx, 1);
-      doSave();
-      updateStatus(ctx);
-      ctx.ui.notify(`Stash ${idx + 1} deleted`, "info");
     }
   }
 
