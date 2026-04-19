@@ -31,10 +31,13 @@
       "packages/model-sort-fix/src/model-sort-fix.ts",
       "packages/model-registry-fix/src/model-registry-fix.ts",
       "packages/smart-compaction/src/smart-compaction.ts",
+      "packages/compaction-tokens/src/index.ts",
       "packages/loop-detector/src/index.ts",
       "packages/autocomplete-base-paths/src/index.ts",
       "packages/queue-emojis/src/index.ts",
-      "packages/content-filter/src/content-filter.ts"
+      "packages/content-filter/src/content-filter.ts",
+      "packages/ctrl-a-multiline/src/ctrl-a-multiline.ts",
+      "./packages/ctrl-e-multiline/src/ctrl-e-multiline.ts"
     ]
   },
   "devDependencies": {

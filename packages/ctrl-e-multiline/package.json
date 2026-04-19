@@ -1,0 +1,18 @@
+{
+	"name": "@ironin/pi-ctrl-e-multiline",
+	"version": "1.0.0",
+	"description": "Rapid Ctrl+E presses navigate to next lines in the editor",
+	"license": "MIT",
+	"author": "CK @ iRonin.IT",
+	"type": "module",
+	"exports": {
+		".": "./src/ctrl-e-multiline.ts"
+	},
+	"files": ["src/"],
+	"pi": {
+		"extensions": ["./src/ctrl-e-multiline.ts"]
+	},
+	"keywords": ["pi-package", "pi-coding-agent", "pi-extension"],
+	"peerDependencies": {
+		"@mariozechner/pi-coding-agent": "*"
+	}
