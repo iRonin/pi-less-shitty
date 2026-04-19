@@ -13,6 +13,8 @@ Vibed by my clanker. Use at your own risk. I test as I go.
 | `@ironin/pi-autocomplete-base-paths` | Multi-directory `@` file autocomplete with per-project config (runtime patch) |
 | `@ironin/pi-cascading-skills` | Walks parent dirs to collect skills from every `.pi/` level |
 | `@ironin/pi-clear-on-double-esc` | Clear editor on double Escape |
+| `@ironin/pi-ctrl-a-multiline` | Rapid Ctrl+A presses navigate to previous lines |
+| `@ironin/pi-ctrl-e-multiline` | Rapid Ctrl+E presses navigate to next lines |
 | `@ironin/pi-git-permissions` | Git-aware file permissions guard |
 | `@ironin/pi-hindsight` | Domain-aware persistent memory via Hindsight (recall/retain/reflect) |
 | `@ironin/pi-hooks` | Regex-based permission system with `.pi-hooks` files |
@@ -28,6 +30,7 @@ Vibed by my clanker. Use at your own risk. I test as I go.
 | `@ironin/pi-session-title` | Auto-title sessions |
 | `@ironin/pi-smart-compaction` | Heuristic turn scoring for compaction instead of blanket LLM summary |
 | `@ironin/pi-content-filter` | Sanitizes profanity from prompts, memories, and tool results via wildcard patterns |
+| `@ironin/pi-queue-emojis` | Adds emojis to steer/follow-up queue displays |
 
 ## Install
 
