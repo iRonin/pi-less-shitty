@@ -80,17 +80,17 @@ export class UserMessageComponent extends Container {
 +        if (lines.length === 0) {
 +            return lines;
 +        }
-+        const border = theme.fg("warning", "─".repeat(Math.max(1, width)));
-+        lines.unshift(border);
-+        // iTerm2 mark on top border
-+        lines[0] = OSC133_A + lines[0];
-+        // Centered ● PROMPT marker in top border
++        const fullBorder = "─".repeat(Math.max(1, width));
 +        const marker = " ● PROMPT ";
++        let markedBorder;
 +        if (width > marker.length) {
 +            const markerStart = Math.floor((width - marker.length) / 2);
-+            lines[0] = lines[0].slice(0, markerStart) + theme.fg("warning", marker) + lines[0].slice(markerStart + marker.length);
++            markedBorder = fullBorder.slice(0, markerStart) + marker + fullBorder.slice(markerStart + marker.length);
++        } else {
++            markedBorder = fullBorder;
 +        }
-+        lines.push(border);
++        lines.unshift(theme.fg("warning", OSC133_A + markedBorder));
++        lines.push(theme.fg("warning", fullBorder));
 +        return lines;
      }
  }
