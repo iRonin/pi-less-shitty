@@ -1,0 +1,68 @@
+# clipboard-image-rendering
+# Target: dist/modes/interactive/interactive-mode.js
+#
+# When user pastes an image, pi saves it to temp path (pi-clipboard-*.png)
+# and inserts the path into editor text. This patch detects these paths
+# in user message text, strips them from display, and renders them inline
+# using pi's Image component after the prompt.
+#
+# How to apply after npm update:
+#   1. Add `Image` to the @mariozechner/pi-tui import (line ~9)
+#   2. Add extractClipboardImages method after getUserMessageText()
+#   3. Modify the "user" case in addMessageToChat to call extractClipboardImages
+
+# === Change 1: Add Image to pi-tui import ===
+# Find: import { CombinedAutocompleteProvider, Container, fuzzyFilter, Loader, ...
+# Add Image after fuzzyFilter:
+#   import { CombinedAutocompleteProvider, Container, fuzzyFilter, Image, Loader, ...
+
+# === Change 2: Add extractClipboardImages method ===
+# Insert after getUserMessageText() method, before showStatus():
+
+extractClipboardImages(text) {
+    const clipboardImageRegex = /(\/(?:var\/folders|tmp)[^\s]*\/pi-clipboard-[^\s]+\.(png|jpg|jpeg|gif|webp))/g;
+    const imagePaths = [];
+    let match;
+    while ((match = clipboardImageRegex.exec(text)) !== null) {
+        imagePaths.push({ full: match[1], ext: match[2] });
+    }
+    if (imagePaths.length === 0) {
+        return { text, images: [] };
+    }
+    const cleanedText = text.replace(clipboardImageRegex, "").trim();
+    const images = [];
+    for (const { full, ext } of imagePaths) {
+        try {
+            if (fs.existsSync(full)) {
+                const base64 = fs.readFileSync(full, "base64");
+                const mimeType = `image/${ext === "jpg" ? "jpeg" : ext}`;
+                images.push(new Image(base64, mimeType, this.getMarkdownThemeWithSettings()));
+            }
+        }
+        catch { /* skip unreadable images */ }
+    }
+    return { text: cleanedText, images };
+}
+
+# === Change 3: Wire into "user" case of addMessageToChat ===
+# Find the case "user": block. Key changes:
+#   - Call extractClipboardImages(textContent) → { text: cleanText, images }
+#   - Use cleanText instead of textContent for parseSkillBlock/UserMessageComponent
+#   - After UserMessageComponent, loop over images and add Spacer + Image
+
+# Before:
+#   const skillBlock = parseSkillBlock(textContent);
+# After:
+#   const { text: cleanText, images } = this.extractClipboardImages(textContent);
+#   const skillBlock = parseSkillBlock(cleanText);
+#
+# Before:
+#   new UserMessageComponent(textContent, ...)
+# After:
+#   new UserMessageComponent(cleanText, ...)
+#
+# Add after the UserMessageComponent block, before populateHistory:
+#   for (const img of images) {
+#       this.chatContainer.addChild(new Spacer(1));
+#       this.chatContainer.addChild(img);
+#   }

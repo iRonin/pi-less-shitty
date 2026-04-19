@@ -1,0 +1,33 @@
+# user-message-borders
+# Target: dist/modes/interactive/components/user-message.js
+#
+# Yellow horizontal borders + OSC 133;A iTerm2 prompt mark + ● PROMPT marker
+#
+# Upstream: plain UserMessageComponent with dead OSC133_ZONE_* constants,
+#           render() just returns super.render(width)
+#
+# How to apply after npm update:
+#   1. Read dist/modes/interactive/components/user-message.js
+#   2. Replace dead OSC133_ZONE_* constants with OSC133_A
+#   3. Replace render() method with the implementation below
+#   4. If upstream structure changed significantly, re-implement the three
+#      features (borders, OSC mark, text marker) in the new structure
+
+render(width) {
+    const lines = super.render(width);
+    if (lines.length === 0) {
+        return lines;
+    }
+    const fullBorder = "─".repeat(Math.max(1, width));
+    const marker = " ● PROMPT ";
+    let markedBorder;
+    if (width > marker.length) {
+        const markerStart = Math.floor((width - marker.length) / 2);
+        markedBorder = fullBorder.slice(0, markerStart) + marker + fullBorder.slice(markerStart + marker.length);
+    } else {
+        markedBorder = fullBorder;
+    }
+    lines.unshift(theme.fg("warning", OSC133_A + markedBorder));
+    lines.push(theme.fg("warning", fullBorder));
+    return lines;
+}
