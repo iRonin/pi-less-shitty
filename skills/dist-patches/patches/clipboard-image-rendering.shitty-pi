@@ -4,7 +4,7 @@
 # When user pastes an image, pi saves it to temp path (pi-clipboard-*.png)
 # and inserts the path into editor text. This patch detects these paths
 # in user message text, strips them from display, and renders them inline
-# using pi's Image component after the prompt.
+# as small previews (30 cells wide) with clickable "Open in Preview" links.
 #
 # How to apply after npm update:
 #   1. Add `Image` to the @mariozechner/pi-tui import (line ~9)
@@ -36,7 +36,7 @@ extractClipboardImages(text) {
             if (fs.existsSync(full)) {
                 const base64 = fs.readFileSync(full, "base64");
                 const mimeType = `image/${ext === "jpg" ? "jpeg" : ext}`;
-                images.push(new Image(base64, mimeType, this.getMarkdownThemeWithSettings()));
+                images.push({ img: new Image(base64, mimeType, this.getMarkdownThemeWithSettings(), { maxWidthCells: 30 }), path: full });
             }
         }
         catch { /* skip unreadable images */ }
@@ -48,7 +48,7 @@ extractClipboardImages(text) {
 # Find the case "user": block. Key changes:
 #   - Call extractClipboardImages(textContent) → { text: cleanText, images }
 #   - Use cleanText instead of textContent for parseSkillBlock/UserMessageComponent
-#   - After UserMessageComponent, loop over images and add Spacer + Image
+#   - After UserMessageComponent, loop over images and add Spacer + Image + clickable link
 
 # Before:
 #   const skillBlock = parseSkillBlock(textContent);
@@ -62,7 +62,9 @@ extractClipboardImages(text) {
 #   new UserMessageComponent(cleanText, ...)
 #
 # Add after the UserMessageComponent block, before populateHistory:
-#   for (const img of images) {
+#   for (const { img, path } of images) {
 #       this.chatContainer.addChild(new Spacer(1));
 #       this.chatContainer.addChild(img);
+#       const hyperlink = `\x1b]8;;file://${path}\x07Open in Preview\x1b]8;;\x07`;
+#       this.chatContainer.addChild(new Text(theme.fg("dim", hyperlink), 1, 0));
 #   }
