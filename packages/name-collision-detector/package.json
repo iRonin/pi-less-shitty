@@ -1,0 +1,12 @@
+{
+  "name": "@ironin/pi-name-collision-detector",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Warns when agent and skill names collide — pi silently drops one when names match.",
+  "keywords": ["pi-package", "pi", "pi-coding-agent"],
+  "pi": {
+    "extensions": ["./src/name-collision-detector.ts"]
+  },
+  "files": ["src", "README.md"],
+  "license": "MIT"
+}

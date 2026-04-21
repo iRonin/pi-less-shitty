@@ -24,6 +24,9 @@ Vibed by my clanker. Use at your own risk. I test as I go.
 | `@ironin/pi-loop-detector` | Detects and prevents infinite retry loops |
 | `@ironin/pi-model-sort-fix` | Fixes `:variant` sort order bug — base models preferred over `:free`, `:nitro`, etc. |
 | `@ironin/pi-model-registry-fix` | Fixes apiKey validation (#3043) and models.json wipe (#3044) in model registry |
+| `@ironin/pi-name-collision-detector` | Warns when agent and skill names collide (same name in `.pi/agents/` and `.pi/skills/`) |
+| `@ironin/pi-model-registry-fix` | Fixes apiKey validation (#3043) and models.json wipe (#3044) in model registry |
+| `@ironin/pi-name-collision-detector` | Warns when agent and skill names collide (same name in `.pi/agents/` and `.pi/skills/`) |
 | `@ironin/pi-prompt-prefix` | Visual-only prefix for user prompts in TUI |
 | `@ironin/pi-prompt-stash` | Ctrl+S stash/pop, Ctrl+Shift+S stash picker, per-CWD storage |
 | `@ironin/pi-queue-emojis` | Adds 🎯/📥 emojis to steer/follow-up queue displays |

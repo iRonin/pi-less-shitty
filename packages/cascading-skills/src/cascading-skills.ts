@@ -204,6 +204,24 @@ function discoverSkills(cwd: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
 
+  // Collect agent names from all ancestor .pi/agents/ directories
+  // so we can skip skill dirs that share a name with an agent
+  // (avoids false "skill not found" warnings when oh-pi resolves skills)
+  const agentNames = new Set<string>();
+  for (const parentDir of walkParents(cwd)) {
+    const agentsDir = path.join(parentDir, ".pi", "agents");
+    if (fs.existsSync(agentsDir) && fs.statSync(agentsDir).isDirectory()) {
+      try {
+        const entries = fs.readdirSync(agentsDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if ((entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".md")) {
+            agentNames.add(entry.name.slice(0, -3)); // strip .md
+          }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
   // — Per-ancestor sources FIRST (walk up from CWD to HOME) —
   // Ancestor skills take priority over global/extension skills because
   // they are closest to the project's CWD and contextually most relevant.
@@ -215,7 +233,11 @@ function discoverSkills(cwd: string): string[] {
     const piDir = path.join(parentDir, ".pi");
     if (fs.existsSync(piDir) && fs.statSync(piDir).isDirectory()) {
       for (const s of collectSkillsDir(path.join(piDir, "skills"))) {
-        ancestorSkillDirs.push(s);
+        // Skip if this skill dir name matches an agent name
+        const skillName = path.basename(s);
+        if (!agentNames.has(skillName)) {
+          ancestorSkillDirs.push(s);
+        }
       }
       const settings = readJson(path.join(piDir, "settings.json"));
       if (settings?.skills) {
@@ -240,12 +262,18 @@ function discoverSkills(cwd: string): string[] {
     addUnique(dir, seen, out);
   }
 
+  // Also exclude any skill whose name matches an agent (even from global sources)
+  function isAgentName(name: string): boolean {
+    return agentNames.has(name);
+  }
+
   // — Global sources (only if NOT shadowed by an ancestor skill) —
 
   /** Add a single skill dir only if its name is not claimed by an ancestor. */
   function addIfNotShadowed(skillDir: string): void {
     const name = extractSkillName(skillDir);
     if (name && ancestorSkillNames.has(name)) return; // ancestor owns this name
+    if (name && isAgentName(name)) return; // name collides with an agent
     addUnique(skillDir, seen, out);
   }
 

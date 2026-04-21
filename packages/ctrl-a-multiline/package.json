@@ -1,7 +1,7 @@
 {
 	"name": "@ironin/pi-ctrl-a-multiline",
 	"version": "1.0.0",
-	"description": "Rapid Ctrl+A presses navigate to previous lines in the editor",
+	"description": "Rapid Ctrl+A navigates to previous lines; ctrl+shift+up/down jump to prompt beginning/end",
 	"license": "MIT",
 	"author": "CK @ iRonin.IT",
 	"type": "module",

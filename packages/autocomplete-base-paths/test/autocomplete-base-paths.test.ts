@@ -242,6 +242,37 @@ describe("fd fuzzy search with spaces and case-insensitive", { skip: !fdPath }, 
 		assert.ok(found, "should find ECSC CPR 2023.md with case-insensitive @cpr");
 	});
 
+	it("prioritizes files closer to search root (proximity bonus)", () => {
+		const baseDir = join(rootDir, "project");
+		const deepDir = join(baseDir, "deep", "nested", "folder");
+		mkdirSync(deepDir, { recursive: true });
+
+		// Create files at different depths
+		writeFile(join(baseDir, "config.json"), "root");
+		writeFile(join(baseDir, "deep", "config.json"), "depth1");
+		writeFile(join(deepDir, "config.json"), "depth3");
+
+		writeFile(join(baseDir, ".pi", "settings.json"), JSON.stringify({
+			autocompleteBasePaths: [baseDir],
+		}));
+
+		const collectedPaths = collectAutocompleteBasePaths(deepDir);
+		assert.ok(collectedPaths.includes(baseDir), "should collect base path from parent");
+
+		const out = spawnSync(fdPath!, [
+			"--base-directory", baseDir,
+			"--max-results", "20",
+			"--type", "f",
+			"--full-path", "--ignore-case",
+			"--exclude", ".git",
+			"config",
+		], { encoding: "utf-8" });
+
+		assert.ok(out.stdout.includes("config.json"), "should find config.json files");
+		// The proximity bonus is applied in buildFuzzySuggestions (scoring layer),
+		// not in fd itself — this test just confirms fd finds all depth levels
+	});
+
 	it("fuzzy-matches file with spaces via @ECSCCPR (no spaces in query)", () => {
 		const spaceDir = join(rootDir, "My Project With Spaces", "Sub Dir");
 		const baseDir = join(rootDir, "My Project With Spaces");

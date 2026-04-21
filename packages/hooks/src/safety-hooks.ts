@@ -22,6 +22,7 @@ import {
   buildBlockReason,
   isAlreadyPrompting,
 } from "./permission-ui.js";
+import { addRule } from "./config-store.js";
 
 export default function (pi: ExtensionAPI) {
   // ─────────────────────────────────────────────────────────────
@@ -91,17 +92,6 @@ export default function (pi: ExtensionAPI) {
       dir = path.dirname(dir);
     }
     return start;
-  }
-
-  function findOrCreateHooksFile(dir: string): string | null {
-    const hooksFile = path.join(dir, ".pi-hooks");
-    if (fs.existsSync(hooksFile)) return hooksFile;
-    try {
-      fs.writeFileSync(hooksFile, "# Pi hooks — auto-created\n", "utf-8");
-      return hooksFile;
-    } catch {
-      return null;
-    }
   }
 
   function isPathSafe(filePath: string, projectDir: string): boolean {
@@ -391,10 +381,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hooksFile = findOrCreateHooksFile(ctx.cwd);
-          if (hooksFile) {
-            try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-          }
+              addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -430,10 +417,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hooksFile = findOrCreateHooksFile(ctx.cwd);
-          if (hooksFile) {
-            try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-          }
+              addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -457,10 +441,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hooksFile = findOrCreateHooksFile(ctx.cwd);
-          if (hooksFile) {
-            try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-          }
+              addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -484,10 +465,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hooksFile = findOrCreateHooksFile(ctx.cwd);
-          if (hooksFile) {
-            try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-          }
+              addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -514,10 +492,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hooksFile = findOrCreateHooksFile(ctx.cwd);
-          if (hooksFile) {
-            try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-          }
+              addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -549,10 +524,7 @@ export default function (pi: ExtensionAPI) {
                   addToSessionAllowlist(cmd);
                 } else if (result.choice === "allow-permanent" && result.permanentPattern) {
                   addToSessionAllowlist(result.permanentPattern);
-                  const hooksFile = findOrCreateHooksFile(ctx.cwd);
-                  if (hooksFile) {
-                    try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-                  }
+              addRule(ctx.cwd, "allow", result.permanentPattern);
                 }
               }
             } catch {}
@@ -583,8 +555,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); continue; }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hf = findOrCreateHooksFile(ctx.cwd);
-          if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -605,8 +576,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); continue; }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hf = findOrCreateHooksFile(ctx.cwd);
-          if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -627,8 +597,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); continue; }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hf = findOrCreateHooksFile(ctx.cwd);
-          if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -649,8 +618,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); continue; }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hf = findOrCreateHooksFile(ctx.cwd);
-          if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -671,8 +639,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); continue; }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hf = findOrCreateHooksFile(ctx.cwd);
-          if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -694,8 +661,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); continue; }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hf = findOrCreateHooksFile(ctx.cwd);
-          if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -717,8 +683,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); continue; }
         if (result.choice === "allow-permanent" && result.permanentPattern) {
           addToSessionAllowlist(result.permanentPattern);
-          const hf = findOrCreateHooksFile(ctx.cwd);
-          if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
           continue;
         }
       }
@@ -757,8 +722,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); break; }
               if (result.choice === "allow-permanent" && result.permanentPattern) {
                 addToSessionAllowlist(result.permanentPattern);
-                const hf = findOrCreateHooksFile(ctx.cwd);
-                if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
                 break;
               }
               break;
@@ -787,8 +751,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); break; }
                 if (result.choice === "allow-permanent" && result.permanentPattern) {
                   addToSessionAllowlist(result.permanentPattern);
-                  const hf = findOrCreateHooksFile(ctx.cwd);
-                  if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
                   break;
                 }
                 break;
@@ -823,8 +786,7 @@ export default function (pi: ExtensionAPI) {
           if (result.choice === "allow-session") { addToSessionAllowlist(cmd); }
             if (result.choice === "allow-permanent" && result.permanentPattern) {
               addToSessionAllowlist(result.permanentPattern);
-              const hf = findOrCreateHooksFile(ctx.cwd);
-              if (hf) { try { fs.appendFileSync(hf, `\nallow ${result.permanentPattern}\n`); } catch {} }
+          addRule(ctx.cwd, "allow", result.permanentPattern);
             }
           }
         } catch {}

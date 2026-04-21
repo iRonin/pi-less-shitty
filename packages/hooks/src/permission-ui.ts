@@ -67,43 +67,53 @@ export function agentDoneSound(): void {
 
 /**
  * Generalize a concrete command into a reusable regex pattern.
- * Keeps the command name, intelligently classifies the second token:
- *   - Flag (starts with `-`) → keep it
- *   - Path (contains `/` or `.`) → generalize
- *   - Subcommand (alphanumeric) → keep it
- *
- * Examples:
- *   expect -c '\n set timeout 25...'    →  ^\s*expect\s+-c\s+.*
- *   git commit -m "fix: bump version"   →  ^\s*git\s+commit\s+.*
- *   rm /tmp/file.txt                    →  ^\s*rm\s+.*
- *   ls -la /some/path                   →  ^\s*ls\s+-la\s+.*
+ * Keeps the full command structure, only generalizes truly variable parts:
+ *   - File paths → [^ ]+
+ *   - Quoted strings → generalized quote pairs
+ *   - UUIDs / long hashes → [0-9a-f]+
+ * Everything else is kept literally.
  */
 export function generateAllowPattern(command: string): string {
   const p = command.trim();
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-  const tokens = p.split(/\s+/);
+  // Tokenize: quoted strings stay intact, everything else splits on whitespace
+  const tokenRegex = /"[^"]*"|'[^']*'|\S+/g;
+  const tokens: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = tokenRegex.exec(p)) !== null) {
+    tokens.push(m[0]);
+  }
+
   if (tokens.length === 0) return "^" + esc(p) + "$";
 
-  const cmd = esc(tokens[0]);
-
-  if (tokens.length === 1) {
-    return "^\\s*" + cmd + "(\\s|$)";
+  const parts: string[] = [];
+  for (const token of tokens) {
+    // Quoted strings → generalized
+    if ((token.startsWith('"') && token.endsWith('"')) ||
+        (token.startsWith("'") && token.endsWith("'"))) {
+      const q = token[0];
+      parts.push(q + '[^"' + (q === "'" ? "'" : '') + "]+" + q);
+    }
+    // Path-like (contains / and not a flag)
+    else if (token.includes("/") && !token.startsWith("-")) {
+      parts.push("[^\\s]+");
+    }
+    // UUID
+    else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) {
+      parts.push("[0-9a-f-]+");
+    }
+    // Long hex hash (8+ chars)
+    else if (/^[0-9a-f]{8,}$/i.test(token)) {
+      parts.push("[0-9a-f]+");
+    }
+    // Everything else → literal (escaped)
+    else {
+      parts.push(esc(token));
+    }
   }
 
-  const t2 = tokens[1];
-
-  // Path-like → generalize the rest
-  if (t2.includes("/") || (t2.includes(".") && t2.length > 3 && !t2.startsWith("-"))) {
-    return "^\\s*" + cmd + "\\s+.*";
-  }
-
-  // Flag or subcommand → keep it, generalize trailing
-  if (tokens.length === 2) {
-    return "^\\s*" + cmd + "\\s+" + esc(t2) + "(\\s|$)";
-  }
-
-  return "^\\s*" + cmd + "\\s+" + esc(t2) + "\\s+.*";
+  return "^\\s*" + parts.join("\\s+") + "$";
 }
 
 // ============================================================================
@@ -215,10 +225,9 @@ export async function askPermission(
         return { choice: "allow-session" };
       }
 
-      case "Allow Permanently": {
-        const pattern = generateAllowPattern(command);
-        return { choice: "allow-permanent", permanentPattern: pattern };
-      }
+      case "Allow Permanently":
+        // Store exact command as literal — config-store handles escaping
+        return { choice: "allow-permanent", permanentPattern: command };
 
       case "Deny":
         return { choice: "deny" };
@@ -260,6 +269,10 @@ export function buildBlockReason(
     case "allow-permanent":
       throw new Error("buildBlockReason called on allow result");
   }
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function truncate(s: string, max: number): string {

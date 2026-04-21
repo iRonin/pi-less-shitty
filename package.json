@@ -37,7 +37,8 @@
       "packages/queue-emojis/src/index.ts",
       "packages/content-filter/src/content-filter.ts",
       "packages/ctrl-a-multiline/src/ctrl-a-multiline.ts",
-      "./packages/ctrl-e-multiline/src/ctrl-e-multiline.ts"
+      "./packages/ctrl-e-multiline/src/ctrl-e-multiline.ts",
+      "./packages/name-collision-detector/src/name-collision-detector.ts"
     ]
   },
   "devDependencies": {

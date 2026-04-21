@@ -20,30 +20,17 @@ import {
   agentDoneSound,
   isAlreadyPrompting,
 } from "./permission-ui.js";
+import {
+  loadHooksConfig,
+  addRule,
+  type HookAction,
+  type LoadedRule,
+} from "./config-store.js";
 
 /**
- * Permission action types
+ * Permission action types — re-exported for checkPermission
  */
-type PermissionAction = "allow" | "ask" | "deny";
-
-/**
- * Parsed permission rule
- */
-interface PermissionRule {
-  action: PermissionAction;
-  pattern: RegExp;
-  rawPattern: string;
-  line: number;
-}
-
-/**
- * Hooks configuration
- */
-interface HooksConfig {
-  rules: PermissionRule[];
-  filePath: string;
-  directory: string;
-}
+type PermissionAction = HookAction;
 
 /**
  * Command context for permission checks
@@ -140,111 +127,33 @@ export function isPathSafe(filePath: string, projectRoot: string): boolean {
 // ============================================================================
 
 /**
- * Find existing .pi-hooks or create one at project root.
+ * Find hooks config — searches from cwd upward (text .pi-hooks auto-migrated).
  */
-function findOrCreateHooksFile(cwd: string): string | null {
-  const hooksFile = path.join(cwd, ".pi-hooks");
-  if (fs.existsSync(hooksFile)) return hooksFile;
-  try {
-    fs.writeFileSync(hooksFile, "# Pi hooks — auto-created\n", "utf-8");
-    return hooksFile;
-  } catch {
-    return null;
+function findHooksConfig(cwd: string): { rules: LoadedRule[]; filePath: string } | null {
+  let dir = cwd;
+  while (dir !== "/" && dir !== ".") {
+    const config = loadHooksConfig(dir);
+    if (config) return config;
+    dir = path.dirname(dir);
   }
+  return null;
 }
 
 /**
- * Find and parse .pi-hooks file in directory tree
- * Searches from cwd up to root, returns config from the deepest file found
+ * Add a permanent rule to the hooks config in CWD.
  */
-function findHooksConfig(cwd: string): HooksConfig | null {
-  let dir = cwd;
-  let hooksFile: string | null = null;
-
-  // Walk up directory tree to find .pi-hooks
-  while (dir !== "/" && dir !== ".") {
-    const candidate = path.join(dir, ".pi-hooks");
-    if (fs.existsSync(candidate)) {
-      hooksFile = candidate;
-      break;
-    }
-    dir = path.dirname(dir);
-  }
-
-  if (!hooksFile) {
-    return null;
-  }
-
-  // Parse the hooks file
-  try {
-    const content = fs.readFileSync(hooksFile, "utf-8");
-    const lines = content.split("\n");
-    const rules: PermissionRule[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmed = line.trim();
-      const lineNum = i + 1;
-
-      // Skip empty lines and comments
-      if (!trimmed || trimmed.startsWith("#")) {
-        continue;
-      }
-
-      // Parse "action pattern" format
-      const spaceIndex = trimmed.indexOf(" ");
-      if (spaceIndex === -1) {
-        console.warn(`[pi-hooks] Line ${lineNum}: Missing space separator in ${hooksFile}`);
-        continue;
-      }
-
-      const action = trimmed.slice(0, spaceIndex) as PermissionAction;
-      const pattern = trimmed.slice(spaceIndex + 1).trim();
-
-      if (!["allow", "ask", "deny"].includes(action)) {
-        console.warn(
-          `[pi-hooks] Line ${lineNum}: Invalid action '${action}' in ${hooksFile}`
-        );
-        continue;
-      }
-
-      if (!pattern) {
-        console.warn(`[pi-hooks] Line ${lineNum}: Empty pattern in ${hooksFile}`);
-        continue;
-      }
-
-      try {
-        rules.push({
-          action,
-          pattern: new RegExp(pattern),
-          rawPattern: pattern,
-          line: lineNum,
-        });
-      } catch (error) {
-        // Silently skip invalid regex patterns to avoid cluttering output
-        // Invalid patterns are logged once during development, not at runtime
-      }
-    }
-
-    return rules.length > 0
-      ? {
-          rules,
-          filePath: hooksFile,
-          directory: path.dirname(hooksFile),
-        }
-      : null;
-  } catch (error) {
-    console.error(`[pi-hooks] Error reading ${hooksFile}:`, error);
-    return null;
+function addPermanentRule(cwd: string, command: string): void {
+  if (!addRule(cwd, "allow", command)) {
+    // CWD not writable — try creating in a parent that exists
+    try { fs.mkdirSync(cwd, { recursive: true }); } catch { return; }
+    addRule(cwd, "allow", command);
   }
 }
 
 /**
  * Check if a command matches any permission rule
- * Returns the action of the first matching rule, or null if no match
- * @internal - exported for testing
  */
-export function checkPermission(command: string, rules: PermissionRule[]): PermissionAction | null {
+export function checkPermission(command: string, rules: LoadedRule[]): PermissionAction | null {
   for (const rule of rules) {
     if (rule.pattern.test(command)) {
       return rule.action;
@@ -502,11 +411,7 @@ export default function (pi: ExtensionAPI) {
           }
           if (result.choice === "allow-permanent" && result.permanentPattern) {
             addToSessionAllowlist(result.permanentPattern);
-            try {
-              fs.appendFileSync(config.filePath, `\nallow ${result.permanentPattern}\n`);
-            } catch (err) {
-              console.error(`[pi-hooks] Failed to write .pi-hooks: ${err}`);
-            }
+            addPermanentRule(ctx.cwd, result.permanentPattern);
             continue;
           }
         }
@@ -532,15 +437,7 @@ export default function (pi: ExtensionAPI) {
           }
           if (result.choice === "allow-permanent" && result.permanentPattern) {
             addToSessionAllowlist(result.permanentPattern);
-            // Try to find or create .pi-hooks
-            const hooksFile = findOrCreateHooksFile(ctx.cwd);
-            if (hooksFile) {
-              try {
-                fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`);
-              } catch (err) {
-                console.error(`[pi-hooks] Failed to write .pi-hooks: ${err}`);
-              }
-            }
+            addPermanentRule(ctx.cwd, result.permanentPattern);
             continue;
           }
           break;
@@ -578,10 +475,7 @@ export default function (pi: ExtensionAPI) {
                 addToSessionAllowlist(cmd);
               } else if (result.choice === "allow-permanent" && result.permanentPattern) {
                 addToSessionAllowlist(result.permanentPattern);
-                const hooksFile = findOrCreateHooksFile(ctx.cwd);
-                if (hooksFile) {
-                  try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-                }
+                addPermanentRule(ctx.cwd, result.permanentPattern);
               }
               break;
             }
@@ -610,10 +504,7 @@ export default function (pi: ExtensionAPI) {
                   addToSessionAllowlist(cmd);
                 } else if (result.choice === "allow-permanent" && result.permanentPattern) {
                   addToSessionAllowlist(result.permanentPattern);
-                  const hooksFile = findOrCreateHooksFile(ctx.cwd);
-                  if (hooksFile) {
-                    try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-                  }
+                  addPermanentRule(ctx.cwd, result.permanentPattern);
                 }
                 break;
               }
@@ -647,10 +538,7 @@ export default function (pi: ExtensionAPI) {
               addToSessionAllowlist(cmd);
             } else if (result.choice === "allow-permanent" && result.permanentPattern) {
               addToSessionAllowlist(result.permanentPattern);
-              const hooksFile = findOrCreateHooksFile(ctx.cwd);
-              if (hooksFile) {
-                try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-              }
+              addPermanentRule(ctx.cwd, result.permanentPattern);
             }
           }
         } catch {}
@@ -702,10 +590,7 @@ export default function (pi: ExtensionAPI) {
               addToSessionAllowlist(cmd);
             } else if (result.choice === "allow-permanent" && result.permanentPattern) {
               addToSessionAllowlist(result.permanentPattern);
-              const hooksFile = findOrCreateHooksFile(ctx.cwd);
-              if (hooksFile) {
-                try { fs.appendFileSync(hooksFile, `\nallow ${result.permanentPattern}\n`); } catch {}
-              }
+              addPermanentRule(ctx.cwd, result.permanentPattern);
             }
             break;
           }

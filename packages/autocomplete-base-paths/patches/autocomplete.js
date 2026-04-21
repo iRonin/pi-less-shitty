@@ -577,12 +577,43 @@ export class CombinedAutocompleteProvider {
             score = 30;
         // Fuzzy char-by-char match in filename
         else {
+            const wordBoundaryPattern = /[\s\-_./]/;
             let fi = 0;
+            let lastMatchIdx = -1;
+            let consecutiveRun = 0;
+            let bestRun = 0;
+            let baseScore = 0;
+
             for (let qi = 0; qi < lowerQuery.length && fi < lowerFileName.length; qi += 1) {
                 const qc = lowerQuery[qi];
                 while (fi < lowerFileName.length && lowerFileName[fi] !== qc) fi += 1;
-                if (fi < lowerFileName.length) { score += 5; fi += 1; }
+                if (fi < lowerFileName.length) {
+                    let charScore = 1.5;
+                    if (lastMatchIdx >= 0 && fi === lastMatchIdx + 1) {
+                        consecutiveRun++;
+                        charScore += 0.3;
+                    } else {
+                        if (consecutiveRun > bestRun) bestRun = consecutiveRun;
+                        consecutiveRun = 1;
+                        if (lastMatchIdx >= 0) {
+                            const gap = fi - lastMatchIdx - 1;
+                            charScore = Math.max(0.3, charScore - gap * 0.25);
+                        }
+                    }
+                    if (fi === 0 || wordBoundaryPattern.test(lowerFileName[fi - 1] ?? "")) {
+                        charScore += 1.5;
+                    }
+                    if (fi < lowerFileName.length * 0.3) {
+                        charScore += 0.5;
+                    }
+                    baseScore += charScore;
+                    lastMatchIdx = fi;
+                    fi += 1;
+                }
             }
+            if (consecutiveRun > bestRun) bestRun = consecutiveRun;
+
+            score = baseScore + Math.log2(1 + bestRun) * 2;
         }
         // Directories get a bonus to appear first
         if (isDirectory && score > 0)
@@ -633,10 +664,17 @@ export class CombinedAutocompleteProvider {
     // Build scored and sorted suggestions from fd results
     buildFuzzySuggestions(entries, fdQuery, displayBase, isQuotedPrefix) {
         const scoredEntries = entries
-            .map((entry) => ({
-            ...entry,
-            score: fdQuery ? this.scoreEntry(entry.path, fdQuery, entry.isDirectory) : 1,
-        }))
+            .map((entry) => {
+                const nameScore = fdQuery ? this.scoreEntry(entry.path, fdQuery, entry.isDirectory) : 1;
+                // Proximity bonus: files closer to search root rank higher (max +5)
+                // Count path separators to determine depth
+                const depth = (entry.path.match(/\//g) || []).length;
+                const proximityBonus = Math.max(0, 5 - depth);
+                return {
+                    ...entry,
+                    score: nameScore + proximityBonus,
+                };
+            })
             .filter((entry) => entry.score > 0);
         scoredEntries.sort((a, b) => b.score - a.score);
         const topEntries = scoredEntries.slice(0, 20);
