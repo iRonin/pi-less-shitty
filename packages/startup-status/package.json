@@ -1,0 +1,15 @@
+{
+  "name": "@ironin/pi-startup-status",
+  "version": "1.0.0",
+  "description": "Reports all runtime patch status at startup. Complements pi's native extension/skills listing.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "main": "src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "startup",
+    "diagnostics"
+  ]
+}

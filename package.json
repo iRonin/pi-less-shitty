@@ -1,0 +1,53 @@
+{
+  "name": "@ironin/pi-less-shitty",
+  "version": "1.0.0",
+  "description": "A monorepo of pi extensions that make it less shitty.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ironin/pi-less-shitty"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "pi": {
+    "extensions": [
+      "packages/cascading-skills/src/cascading-skills.ts",
+      "packages/clear-on-double-esc/src/index.ts",
+      "packages/kilocode-model-fix/src/kilocode-model-fix.ts",
+      "packages/git-permissions/src/index.ts",
+      "packages/hindsight/index.ts",
+      "packages/hooks/src/index.ts",
+      "packages/hooks/src/safety-hooks.ts",
+      "packages/keybindings/index.ts",
+      "packages/prompt-prefix/src/prompt-prefix.ts",
+      "packages/prompt-stash/src/prompt-stash.ts",
+      "packages/read-full/src/read-full.ts",
+      "packages/session-recall/src/session-recall.ts",
+      "packages/session-title/src/index.ts",
+      "packages/model-sort-fix/src/model-sort-fix.ts",
+      "packages/model-registry-fix/src/model-registry-fix.ts",
+      "packages/smart-compaction/src/smart-compaction.ts",
+      "packages/compaction-tokens/src/index.ts",
+      "packages/loop-detector/src/index.ts",
+      "packages/autocomplete-base-paths/src/index.ts",
+      "packages/queue-emojis/src/index.ts",
+      "packages/content-filter/src/content-filter.ts",
+      "packages/ctrl-a-multiline/src/ctrl-a-multiline.ts",
+      "./packages/ctrl-e-multiline/src/ctrl-e-multiline.ts",
+      "./packages/name-collision-detector/src/name-collision-detector.ts",
+      "packages/smart-dequeue/src/index.ts",
+      "packages/prompt-dump/src/index.ts",
+      "packages/startup-status/src/index.ts",
+      "packages/agents-listing/src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4"
+  }
+}

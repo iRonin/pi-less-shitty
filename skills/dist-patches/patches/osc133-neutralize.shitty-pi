@@ -1,0 +1,16 @@
+# osc133-neutralize
+# Target: dist/modes/interactive/components/user-message.js
+# Target: dist/modes/interactive/components/assistant-message.js
+#
+# Upstream pi v0.68+ injects OSC 133 shell integration escape sequences
+# (\\x1b]133;A\\x07, \\x1b]133;B\\x07, \\x1b]133;C\\x07) into user and
+# assistant message components. These cause iTerm2 viewport corruption —
+# text gets pushed off-screen after agent responses.
+#
+# Fix: neutralize all three OSC133 constants to empty strings.
+
+# How to apply after npm update:
+#   For both user-message.js and assistant-message.js:
+#   const OSC133_ZONE_START = "";
+#   const OSC133_ZONE_END = "";
+#   const OSC133_ZONE_FINAL = "";

@@ -1,0 +1,4 @@
+#!/bin/bash
+# pi --release-check: Release verification wrapper
+# Usage: pi --release-check
+exec npx tsx /Users/ironin/Work/Pi-Agent/pi-less-shitty/scripts/release-check.ts "$@"

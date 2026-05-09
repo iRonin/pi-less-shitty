@@ -1,0 +1,32 @@
+# prompt-dump CLI flag
+
+## Target files
+- `cli/args.js` — recognise `--prompt-dump`
+- `main.js` — dump assembled prompt with chalk colours, section breakdown, file list
+
+## Patch 1: cli/args.js
+
+**Inject after:** `else if (arg === "--offline")`
+
+```js
+        else if (arg === "--prompt-dump") {
+            result.promptDump = true;
+        }
+```
+
+## Patch 2: main.js
+
+**Replace** the entire block between `// --- prompt-dump handler ---` and `// --- end prompt-dump handler ---` with the full implementation that includes:
+- `session.bindExtensions({})` to load extension resources
+- Section breakdown with regex markers (Preamble, Tools, Guidelines, Pi docs, Project Context, Skills, Footer)
+- `chalk.bold`/`chalk.green`/`chalk.cyan`/`chalk.yellow`/`chalk.dim` for coloured output
+- Context files listing with per-file token counts
+- Skills listing
+- Full system prompt output
+- Token/char summary
+
+See `packages/prompt-dump/src/index.ts` for the complete implementation.
+
+## Apply
+Run `scripts/apply-all-patches.ts` or the prompt-dump extension (auto-applies on load + session_start).
+Verify with `pi --prompt-dump`.

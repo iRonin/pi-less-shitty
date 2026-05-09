@@ -1,0 +1,17 @@
+{
+	"name": "pi-ironin-patch-applier",
+	"version": "0.1.0",
+	"description": "AI-driven patch applier for pi customizations. Specs + tests are durable; text edits are re-derived against the current dist on every pi upgrade.",
+	"type": "module",
+	"main": "src/index.ts",
+	"license": "MIT",
+	"author": "CK @ iRonin.IT",
+	"keywords": ["pi-package", "pi-extension", "patcher", "ai-patcher"],
+	"engines": { "node": ">=22" },
+	"pi": {
+		"extensions": ["src/index.ts"]
+	},
+	"scripts": {
+		"test": "node --experimental-strip-types --test test/*.test.ts"
+	}
+}

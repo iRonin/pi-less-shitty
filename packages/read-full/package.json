@@ -1,0 +1,37 @@
+{
+  "name": "pi-ironin-read-full",
+  "version": "1.0.0",
+  "description": "Read entire files with configurable cap. Bypasses the built-in read tool's 50KB/2000-line limit.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/read-full"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
+  "type": "module",
+  "exports": {
+    ".": "./src/read-full.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/read-full.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "read",
+    "files"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-tui": "*",
+    "@sinclair/typebox": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

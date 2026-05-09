@@ -1,0 +1,33 @@
+{
+  "name": "pi-ironin-git-permissions",
+  "version": "1.0.0",
+  "description": "Git-aware file permissions guard for pi.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/git-permissions"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

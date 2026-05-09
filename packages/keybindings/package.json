@@ -1,0 +1,36 @@
+{
+  "name": "pi-ironin-keybindings",
+  "version": "0.1.0",
+  "description": "Configurable key bindings for pi — bind keys to actions via an interactive wizard.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iRonin/pi-less-shitty",
+    "directory": "packages/keybindings"
+  },
+  "homepage": "https://github.com/iRonin/pi-less-shitty#readme",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "src/",
+    "index.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "keybindings"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

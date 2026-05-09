@@ -1,0 +1,15 @@
+{
+  "name": "@ironin/pi-prompt-dump",
+  "version": "1.0.0",
+  "description": "/prompt-dump command — replaces the lost --prompt-dump CLI flag. Dumps assembled system prompt, context files, tools, skills, and extensions.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "main": "src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "debug",
+    "prompt"
+  ]
+}

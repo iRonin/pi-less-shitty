@@ -1,0 +1,16 @@
+# clipboard-image-rendering
+
+## Target file
+- `dist/modes/interactive/interactive-mode.js`
+
+## What it does
+When user pastes an image, pi saves it to `/var/folders/.../pi-clipboard-*.png` and inserts the path into editor text. This patch detects these paths in user messages, strips them from display, and renders them inline as image previews (30 cells wide) with clickable "Open in Preview" links.
+
+## Changes
+1. Add `Image` to pi-tui import
+2. Add `extractClipboardImages(text)` method — regex matches `/var/folders/.../pi-clipboard-*.png` paths, reads as base64, creates `Image` components
+3. Wire into `"user"` case of `addMessageToChat` — extracts images, cleans text, renders images below message
+
+## Apply
+Run `scripts/apply-all-patches.ts` (calls `patchClipboardImages()`) or `scripts/patch-clipboard-images.ts` standalone.
+Verify by pasting an image in pi — should see inline preview instead of file path.

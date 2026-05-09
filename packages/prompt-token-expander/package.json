@@ -1,0 +1,27 @@
+{
+	"name": "@ironin/pi-prompt-token-expander",
+	"version": "1.0.0",
+	"description": "Expand tokens like {{PI_DIST}} in the assembled system prompt at session start. Survives scope renames and version upgrades.",
+	"license": "MIT",
+	"author": "CK @ iRonin.IT",
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"files": [
+		"src/"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"keywords": [
+		"pi-package",
+		"pi-coding-agent",
+		"pi-extension"
+	],
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}

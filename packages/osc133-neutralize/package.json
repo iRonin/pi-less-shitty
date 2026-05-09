@@ -1,0 +1,12 @@
+{
+  "name": "pi-osc133-neutralize",
+  "version": "1.0.0",
+  "description": "Neutralize OSC 133 iTerm2 shell integration markers that cause graphics issues",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}

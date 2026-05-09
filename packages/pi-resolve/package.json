@@ -1,0 +1,28 @@
+{
+	"name": "@ironin/pi-resolve",
+	"version": "1.0.0",
+	"description": "Scope-aware resolver for the live pi-coding-agent install. Survives the @mariozechner → @earendil-works rename and any future scope change.",
+	"license": "MIT",
+	"author": "CK @ iRonin.IT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/iRonin/pi-less-shitty",
+		"directory": "packages/pi-resolve"
+	},
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"files": [
+		"src/"
+	],
+	"keywords": [
+		"pi-package",
+		"pi-coding-agent",
+		"internal-helper"
+	],
+	"scripts": {
+		"test": "node --experimental-strip-types --test test/*.test.ts"
+	},
+	"private": true
+}

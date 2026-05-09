@@ -1,0 +1,19 @@
+{
+	"name": "@ironin/pi-ctrl-a-multiline",
+	"version": "1.0.0",
+	"description": "Rapid Ctrl+A navigates to previous lines; ctrl+shift+up/down jump to prompt beginning/end",
+	"license": "MIT",
+	"author": "CK @ iRonin.IT",
+	"type": "module",
+	"exports": {
+		".": "./src/ctrl-a-multiline.ts"
+	},
+	"files": ["src/"],
+	"pi": {
+		"extensions": ["./src/ctrl-a-multiline.ts"]
+	},
+	"keywords": ["pi-package", "pi-coding-agent", "pi-extension"],
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}

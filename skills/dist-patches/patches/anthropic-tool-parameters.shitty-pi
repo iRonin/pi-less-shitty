@@ -1,0 +1,32 @@
+# anthropic-tool-parameters
+# Target: node_modules/@mariozechner/pi-ai/dist/providers/anthropic.js
+#
+# Fix: "Cannot read properties of undefined (reading 'properties')" crash
+# when a tool has no `parameters` schema (undefined).
+#
+# Upstream bug: convertTools() assigns tool.parameters directly, then
+# accesses schema.properties on it without null check.
+#
+# Triggered by: anthropic/claude-opus-4-7 (and potentially other models)
+# when passed tools without parameter schemas.
+#
+# Introduced in: @mariozechner/pi-ai@0.67.68
+#
+# How to apply after npm update:
+#   1. Read node_modules/@mariozechner/pi-ai/dist/providers/anthropic.js
+#   2. Find convertTools() function (~line 740)
+#   3. Change:
+#      const schema = tool.parameters;
+#      To:
+#      const schema = tool.parameters ?? {};
+#   4. Verify with: pi --model anthropic/claude-opus-4-7 -p "say hello"
+
+Before:
+    return tools.map((tool, index) => {
+        const schema = tool.parameters;
+        return {
+
+After:
+    return tools.map((tool, index) => {
+        const schema = tool.parameters ?? {};
+        return {
