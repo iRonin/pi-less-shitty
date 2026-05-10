@@ -111,11 +111,37 @@ function patchInteractiveModeJs(distDir: string): "patched" | "already" | "faile
                     return _files;
                 };
 
-                // 1. Walk up .pi/agents/ from cwd.
                 // CRITICAL: use this.sessionManager.getCwd() — this.session.cwd
                 // is undefined here (showLoadedResources runs before session
                 // is fully set up).
-                let _current = this.sessionManager.getCwd();
+                const _cwd = this.sessionManager.getCwd();
+
+                // 0. Honor subagents.excludeBuiltins flag from .pi/settings.json,
+                //    matching oh-pi's behavior (see oh-pi/agents.ts:280-291).
+                //    When set, oh-pi suppresses BOTH user-global and bundled
+                //    builtin agents — only project (walk-up) agents are
+                //    discoverable. Most common in legal/sandboxed cwds where
+                //    surfacing dev-tooling agents to the LLM is harmful.
+                let _excludeBuiltins = false;
+                {
+                    let _w = _cwd;
+                    for (let _i = 0; _i < 20; _i++) {
+                        const _settingsPath = path.join(_w, '.pi', 'settings.json');
+                        if (fs.existsSync(_settingsPath)) {
+                            try {
+                                const _raw = JSON.parse(fs.readFileSync(_settingsPath, 'utf8'));
+                                if (_raw?.subagents?.excludeBuiltins === true) _excludeBuiltins = true;
+                            } catch {}
+                            break; // first .pi/settings.json wins, like oh-pi
+                        }
+                        const _p = path.dirname(_w);
+                        if (_p === _w) break;
+                        _w = _p;
+                    }
+                }
+
+                // 1. Walk up .pi/agents/ from cwd. ALWAYS scanned (project agents).
+                let _current = _cwd;
                 const _visited = new Set();
                 for (let _i = 0; _i < 10; _i++) {
                     const _agentsDir = path.join(_current, '.pi', 'agents');
@@ -129,12 +155,15 @@ function patchInteractiveModeJs(distDir: string): "patched" | "already" | "faile
                 }
 
                 // 2. Additional agent dirs (user-global + path-based package agents/).
-                // List baked at extension-load time — see resolveAdditionalAgentDirs().
-                const _extra = ${JSON.stringify(resolveAdditionalAgentDirs())};
-                for (const _d of _extra) {
-                    if (!_visited.has(_d)) {
-                        _visited.add(_d);
-                        _agentNames.push(..._findAgentFiles(_d));
+                //    Skipped when subagents.excludeBuiltins=true. List baked at
+                //    extension-load time — see resolveAdditionalAgentDirs().
+                if (!_excludeBuiltins) {
+                    const _extra = ${JSON.stringify(resolveAdditionalAgentDirs())};
+                    for (const _d of _extra) {
+                        if (!_visited.has(_d)) {
+                            _visited.add(_d);
+                            _agentNames.push(..._findAgentFiles(_d));
+                        }
                     }
                 }
 
