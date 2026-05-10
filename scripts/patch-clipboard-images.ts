@@ -17,16 +17,27 @@ export function patchClipboardImages(): void {
   let c = fs.readFileSync(f, 'utf8');
   let changed = false;
 
-  // 1. Add Image to import — detect scope from existing line so the
-  // rewrite preserves it (whether @earendil-works/pi-tui or @earendil-works/pi-tui)
-  if (!c.includes('Image, Loader, Markdown')) {
-    const importRe = /import \{ CombinedAutocompleteProvider, Container, fuzzyFilter, Loader, Markdown, matchesKey, ProcessTerminal, Spacer, setKeybindings, Text, TruncatedText, TUI, visibleWidth, \} from "(@[a-z-]+\/pi-tui)";/;
-    const m = c.match(importRe);
-    if (m) {
-      const scope = m[1];
+  // 1. Add `Image` to the pi-tui import.
+  //
+  // Robust to upstream adding/removing other named imports (v0.74.0 added
+  // `getCapabilities` and `hyperlink` which broke the previous exact-list
+  // match). Approach: find the import line by `from "<scope>/pi-tui"`,
+  // parse brace contents, insert `Image` if absent, reconstruct.
+  // Symbols sorted case-insensitively to match upstream's typical style.
+  const piTuiImportRe = /import \{([^}]+)\} from "(@[a-z-]+\/pi-tui)";/;
+  const importMatch = c.match(piTuiImportRe);
+  if (importMatch) {
+    const symbols = importMatch[1]
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (!symbols.includes('Image')) {
+      symbols.push('Image');
+      symbols.sort((a, b) => a.localeCompare(b, 'en', { caseFirst: 'lower' }));
+      const scope = importMatch[2];
       c = c.replace(
-        importRe,
-        `import { CombinedAutocompleteProvider, Container, fuzzyFilter, Image, Loader, Markdown, matchesKey, ProcessTerminal, Spacer, setKeybindings, Text, TruncatedText, TUI, visibleWidth, } from "${scope}";`,
+        piTuiImportRe,
+        `import { ${symbols.join(', ')}, } from "${scope}";`,
       );
       changed = true;
     }
@@ -85,22 +96,43 @@ export function patchClipboardImages(): void {
     changed = true;
   }
 
-  // 3. Wire into user case
+  // 3. Wire into user case.
+  //
+  // v0.74.0+ inserted an `if (this.chatContainer.children.length > 0)` block
+  // between the `if (textContent)` and `parseSkillBlock(...)` lines, breaking
+  // the original 3-line exact-match anchor. Use a regex that just anchors on
+  // `const skillBlock = parseSkillBlock(textContent);` and inject the
+  // displayText/images definitions IMMEDIATELY BEFORE that line.
+  //
+  // Idempotent: skipped when `extractClipboardImages(textContent)` already
+  // present in the file.
   if (!c.includes('extractClipboardImages(textContent)')) {
-    const oldUser = `const textContent = this.getUserMessageText(message);
-                if (textContent) {
-                    const skillBlock = parseSkillBlock(textContent);`;
-    const newUser = `const textContent = this.getUserMessageText(message);
-                if (textContent) {
-                    const { text: cleanText, images } = this.extractClipboardImages(textContent);
-                    const displayText = cleanText || textContent;
-                    const skillBlock = parseSkillBlock(displayText);`;
-    c = c.replace(oldUser, newUser);
-    changed = true;
+    const skillAnchor = /(\s+)(const skillBlock = parseSkillBlock\(textContent\);)/;
+    const m = c.match(skillAnchor);
+    if (m) {
+      const indent = m[1].replace(/^\n+/, '');
+      const inject =
+        m[1] +
+        `const { text: cleanText, images: clipImages } = this.extractClipboardImages(textContent);` +
+        `\n${indent}const displayText = cleanText || textContent;` +
+        `\n${indent}const images = clipImages;` +
+        `\n${indent}` + m[2];
+      c = c.replace(skillAnchor, inject);
+      changed = true;
+    }
+    // No-match is silently skipped; steps 4 and 5 below are gated on this
+    // step having run via the `extractClipboardImages(textContent)` includes()
+    // check, so they won't fire and produce a half-applied patch.
   }
 
-  // 4. Replace textContent with displayText in UserMessageComponent
-  if (c.includes('new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings())') && !c.includes('new UserMessageComponent(displayText,')) {
+  // 4. Replace textContent with displayText in UserMessageComponent.
+  //    Gated on step 3 having run — if the user case wasn't wired,
+  //    `displayText` won't exist in scope and replacing here would crash pi.
+  if (
+    c.includes('extractClipboardImages(textContent)') &&
+    c.includes('new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings())') &&
+    !c.includes('new UserMessageComponent(displayText,')
+  ) {
     c = c.replace(
       'new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings())',
       'new UserMessageComponent(displayText, this.getMarkdownThemeWithSettings())'
@@ -108,8 +140,13 @@ export function patchClipboardImages(): void {
     changed = true;
   }
 
-  // 5. Add image rendering after user case
-  if (!c.includes('for (const { img, path } of images)')) {
+  // 5. Add image rendering after user case.
+  //    Also gated on step 3 having succeeded — the loop references `images`
+  //    which only exists if step 3 declared it.
+  if (
+    c.includes('extractClipboardImages(textContent)') &&
+    !c.includes('for (const { img, path } of images)')
+  ) {
     const insertMarker = `if (options?.populateHistory) {
                         this.editor.addToHistory?.(textContent);
                     }
