@@ -51,7 +51,11 @@ import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { scoreAllMessages, scoreAllMessagesSync, classify } from "./scorer.js";
 import { detectRetryLoops, type RetryLoop } from "./pattern-detector.js";
-import { buildModelChain, buildDeterministicSummary } from "./fallback-chain.js";
+// NOTE: buildModelChain / buildDeterministicSummary intentionally NOT used
+// here. Per user policy: only the configured compactionModel is tried;
+// failures propagate as hard errors. No silent fallback to other providers,
+// no deterministic non-LLM rescue. Those helpers remain in fallback-chain.ts
+// for archived test coverage but are dead code at this layer.
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -66,12 +70,12 @@ interface SmartCompactionSettings {
   skipUnderMessages: number;
   scoringProvider: string;  // e.g. "openrouter", "google", "anthropic"
   scoringModel: string;      // e.g. "google/gemini-2.5-flash-lite"
-  compactionModel: string;   // e.g. "qwen/qwen3.6-plus" — model for LLM summary (falls back to session model if unset)
-  // Ordered fallback chain when the primary compactionModel returns empty/errors.
-  // Each entry is "<provider>/<model>" or just "<model>" (looked up across providers).
-  // The session model is always tried last before the deterministic fallback,
-  // so users only need to specify cross-provider rescue models here.
-  compactionFallbackModels: string[];
+  compactionModel: string;   // e.g. "qwen/qwen3.6-plus" — model for LLM summary (required — if missing, session model is used)
+  // FALLBACK CHAIN INTENTIONALLY REMOVED.
+  // Per user policy: if the configured compactionModel returns empty or
+  // errors, the compaction MUST fail loudly so the user notices. Silently
+  // calling a different provider/model is dishonest — the user wants their
+  // configured model or nothing.
 }
 
 const DEFAULT_SETTINGS: SmartCompactionSettings = {
@@ -84,12 +88,6 @@ const DEFAULT_SETTINGS: SmartCompactionSettings = {
   scoringProvider: "openrouter",
   scoringModel: "google/gemini-2.5-flash-lite",
   compactionModel: "",
-  // Defaults: known reliable summarizers across two providers. Empty ones get
-  // skipped at lookup time so this is safe even when the user has neither.
-  compactionFallbackModels: [
-    "openrouter/google/gemini-2.5-flash-lite",
-    "openrouter/anthropic/claude-haiku-4.5",
-  ],
 };
 
 function readSettingsJson(): Partial<SmartCompactionSettings> {
@@ -108,9 +106,13 @@ function readSettingsJson(): Partial<SmartCompactionSettings> {
     if (typeof sc.scoringProvider === "string") out.scoringProvider = sc.scoringProvider as string;
     if (typeof sc.scoringModel === "string") out.scoringModel = sc.scoringModel as string;
     if (typeof sc.compactionModel === "string") out.compactionModel = sc.compactionModel as string;
-    if (Array.isArray(sc.compactionFallbackModels)
-        && (sc.compactionFallbackModels as unknown[]).every((x) => typeof x === "string")) {
-      out.compactionFallbackModels = sc.compactionFallbackModels as string[];
+    if (Array.isArray(sc.compactionFallbackModels)) {
+      // Honored for one release as a deprecation notice. Drop in next release.
+      console.error(
+        "[smart-compaction] WARN: settings.smartCompaction.compactionFallbackModels is no longer honored. "
+        + "Smart compaction now uses ONLY the configured compactionModel and fails loudly if it can't summarize. "
+        + "Remove this key from your settings.json to silence this warning.",
+      );
     }
     return out;
   } catch {
@@ -257,54 +259,49 @@ Be dense with information. Every line should be something the next agent needs t
 ${conversationText}
 </conversation>${prevCtx}${focusCtx}${filesCtx}`;
 
-  // Build the candidate model chain: [primary, primary (1 retry), ...fallbacks, session].
-  // Dedup by provider/id so we don't waste calls on the same model when the
-  // user's compactionModel coincides with their session model.
-  const candidates = buildModelChain(model, ctx, modelRegistry, settings);
-
-  const attemptDiagnostics: string[] = [];
-  for (let i = 0; i < candidates.length; i++) {
-    const m = candidates[i];
-    const tag = `${m.provider}/${m.id}`;
-    try {
-      const text = await callOneModel(m, modelRegistry, promptText, signal);
-      if (text) {
-        if (i > 0) {
-          console.error(`[smart-compaction] recovered via fallback model ${tag} after ${i} failed attempt(s)`);
-        }
-        return text;
-      }
-      attemptDiagnostics.push(`${tag}: empty response`);
-      console.error(`[smart-compaction] WARN: ${tag} returned empty content, trying next candidate`);
-    } catch (err: any) {
-      // Re-throw on user abort — we never want to retry through a cancellation.
-      if (signal.aborted || err?.name === "AbortError") throw err;
-      attemptDiagnostics.push(`${tag}: ${err?.message ?? String(err)}`);
-      console.error(`[smart-compaction] WARN: ${tag} threw: ${err?.message ?? err}, trying next candidate`);
-    }
-  }
-
-  // Last-resort: deterministic non-LLM summary built from the scored messages
-  // themselves. This guarantees /compact never crashes the session even when
-  // every configured model is unreachable. The returned summary is plain-text
-  // pi-style markdown so the next agent turn has SOMETHING to work from.
+  // SINGLE configured model. No retry, no provider fallback, no deterministic
+  // rescue. The user explicitly chose this model in their settings.json (or
+  // implicitly via the session model fallback in resolveCompactionModel) and
+  // wants to know if it's not working — not have a different model silently
+  // substitute.
+  const tag = `${model.provider}/${model.id}`;
   console.error(
-    `[smart-compaction] All ${candidates.length} model candidate(s) failed; ""
-    + falling back to deterministic non-LLM summary. Diagnostics:\n  - ` +
-    attemptDiagnostics.join("\n  - "),
+    `[smart-compaction] prompt size: ${promptText.length} chars (~${Math.ceil(promptText.length / 4)} tokens), calling ${tag}`,
   );
-  return buildDeterministicSummary(scoredFlat, loops, previousSummary, readFiles, modifiedFiles, attemptDiagnostics);
+
+  const { text, diag } = await callOneModelWithDiag(model, modelRegistry, promptText, signal);
+  if (text) return text;
+
+  // Empty response from the configured model — hard fail. Surface the
+  // diagnostic shape (stop reason, block types, usage) so the user can see
+  // WHY their model didn't produce content.
+  throw new Error(
+    `Smart compaction: configured model ${tag} returned empty content (${diag}). `
+    + `No fallback chain is in use — fix the model config or check the provider.`,
+  );
 }
 
-// Single model invocation. Returns the trimmed text from text or thinking
-// blocks, or empty string if the response had neither. Throws on auth/network
-// errors so the caller can decide whether to retry the next candidate.
-async function callOneModel(
+// Single model invocation with diagnostic shape return.
+//
+// Returns { text, diag } where text is the trimmed text-or-thinking summary
+// (empty string if neither present) and diag is a short human-readable
+// description of WHY a response was empty (stop reason, content shape, usage).
+//
+// Throws on auth/network errors. Returns text="" with a populated diag on
+// empty content — caller decides what to do (currently: throws).
+//
+// maxTokens INTENTIONALLY OMITTED. The previous implementation capped at
+// 4096 then 8192, but reasoning models (qwen3.6-plus, etc.) consume the
+// budget on the thinking chain and emit zero output text. Letting the
+// provider use its default ceiling avoids hitting that wall. If a user
+// hits a per-model quota error, that's a real signal — not something to
+// paper over with an artificial smaller cap.
+async function callOneModelWithDiag(
   model: any,
   modelRegistry: any,
   promptText: string,
   signal: AbortSignal,
-): Promise<string> {
+): Promise<{ text: string; diag: string }> {
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
     throw new Error(`auth failed (ok=${auth.ok} error=${auth.error ?? "none"})`);
@@ -316,26 +313,58 @@ async function callOneModel(
       content: [{ type: "text" as const, text: promptText }],
       timestamp: Date.now(),
     }] },
-    { apiKey: auth.apiKey, headers: auth.headers, maxTokens: 4096, signal },
+    { apiKey: auth.apiKey, headers: auth.headers, signal },
   );
-  const text = (response.content ?? [])
+
+  const content = response.content ?? [];
+  const text = (Array.isArray(content) ? content : [])
     .filter((c: any): c is { type: "text"; text: string } => c?.type === "text")
     .map((c: any) => c.text)
     .join("\n")
     .trim();
-  if (text) return text;
+  if (text) return { text, diag: "" };
+
   // Thinking-only response — some reasoning models do this. Use it as the
   // summary rather than treating it as a failure.
-  const thinking = (response.content ?? [])
+  const thinking = (Array.isArray(content) ? content : [])
     .filter((c: any) => c?.type === "thinking" && typeof c.thinking === "string")
     .map((c: any) => c.thinking)
     .join("\n")
     .trim();
   if (thinking) {
     console.error(`[smart-compaction] using thinking-block fallback (${thinking.length} chars)`);
-    return thinking;
+    return { text: thinking, diag: "" };
   }
-  return "";
+
+  // Empty — build a diagnostic so the user can see WHY this candidate failed.
+  // Things to surface:
+  //   - response.stopReason: "max_tokens" => bump budget; "stop" w/ no content
+  //     => model rejected/empty-completed; "safety" => content filtered.
+  //   - block-type histogram: any non-text-non-thinking blocks (toolUse, etc.)
+  //   - usage.output: 0 => model emitted no tokens at all; high => budget
+  //     consumed by something we're not extracting (e.g. a different block
+  //     type or a malformed payload).
+  const stopReason = (response as any)?.stopReason ?? "?";
+  const usage = (response as any)?.usage ?? {};
+  const inputTok = usage?.input ?? "?";
+  const outputTok = usage?.output ?? "?";
+  const types = Array.isArray(content)
+    ? content.map((c: any) => c?.type ?? "unknown").join(",") || "∅"
+    : typeof content;
+  const diag = `stop=${stopReason} blocks=[${types}] usage=${inputTok}→${outputTok}`;
+  return { text: "", diag };
+}
+
+// Legacy wrapper for any external caller still importing the old name.
+// Returns just the text — no diagnostics.
+async function callOneModel(
+  model: any,
+  modelRegistry: any,
+  promptText: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const { text } = await callOneModelWithDiag(model, modelRegistry, promptText, signal);
+  return text;
 }
 
 // (buildModelChain / buildDeterministicSummary / resolveModelString live in
