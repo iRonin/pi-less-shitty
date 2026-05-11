@@ -370,6 +370,14 @@ async function watchRetainOperation(
     if (units === null || units === 0) {
       log(`retain-poll: zero-facts op=${operationId} bank=${bank} age_ms=${op_age_ms} units=${units}`);
       try { ctx.ui.setStatus?.("hindsight", "⚠ 0 facts retained"); } catch {}
+      // Phase C: a zero-facts retain means the LLM extraction silently
+      // failed. Mark hindsight unhealthy so the next before_agent_start can
+      // enforce healthGate (warn = status only; block = abort the turn).
+      // healthGate=off skips marking entirely so behavior matches Phase B.
+      try {
+        const settings = loadSettings();
+        if (settings.healthGate !== "off") markUnhealthy("zero-facts retain");
+      } catch (e) { log(`retain-poll: loadSettings failed ${e}`); }
       pi.sendMessage(
         {
           customType: "hindsight-retain-zero-facts",
@@ -403,6 +411,234 @@ interface HookStats {
 }
 
 const hookStats: Record<string, HookStats> = { sessionStart: {}, recall: {}, retain: {} };
+
+// ─── Phase C: Settings + Health Gate ─────────────────────────────────────
+//
+// User-tunable robustness knobs. Sources (in priority order, last wins):
+//   1. ~/.pi/agent/hindsight.json   (preferred — pi-wide)
+//   2. .hindsight/config.toml       (already loaded via resolveConfig; legacy
+//                                    flat keys: health_gate, recall_retry_*)
+//
+// Defaults are backwards-compatible with pre-Phase C behavior:
+//   - healthGate="warn" (current behavior — status only)
+//   - retries=3, backoffMs=1000
+//   - recallTimeoutMs=5000 (bumped from 2000 — root cause of ⚠ retrying)
+//
+// Health gate semantics:
+//   off   → never blocks, never warns. Status bar still reflects errors.
+//   warn  → status bar only (DEFAULT — current behavior).
+//   block → mark hindsight UNHEALTHY on:
+//             (a) zero-facts retain (Phase B silent failure)
+//             (b) all-auth-failed recall
+//             (c) recall exhausted retries without success
+//           …then on next before_agent_start, call ctx.abort() and inject
+//           a sentinel message instructing the user to fix or override.
+//           Cleared by: /hindsight reset, or a subsequent successful recall.
+
+export type HealthGate = "off" | "warn" | "block";
+
+export interface HindsightSettings {
+  healthGate: HealthGate;
+  recallRetry: { attempts: number; backoffMs: number };
+  recallTimeoutMs: number;
+}
+
+export const DEFAULT_SETTINGS: HindsightSettings = {
+  healthGate: "warn",
+  recallRetry: { attempts: 3, backoffMs: 1000 },
+  recallTimeoutMs: 5000,
+};
+
+const SETTINGS_PATH = join(homedir(), ".pi", "agent", "hindsight.json");
+
+function clampInt(v: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+export function normalizeHealthGate(v: unknown): HealthGate {
+  return v === "off" || v === "block" || v === "warn" ? v : DEFAULT_SETTINGS.healthGate;
+}
+
+/**
+ * Merge raw JSON / TOML overrides into a defaulted HindsightSettings shape.
+ * Exported for direct unit testing.
+ */
+export function buildSettings(
+  jsonOverride: Partial<HindsightSettings> | null,
+  tomlOverride: Record<string, string> | null,
+): HindsightSettings {
+  const base: HindsightSettings = {
+    healthGate: DEFAULT_SETTINGS.healthGate,
+    recallRetry: { ...DEFAULT_SETTINGS.recallRetry },
+    recallTimeoutMs: DEFAULT_SETTINGS.recallTimeoutMs,
+  };
+  if (jsonOverride) {
+    if (jsonOverride.healthGate !== undefined) base.healthGate = normalizeHealthGate(jsonOverride.healthGate);
+    if (jsonOverride.recallRetry) {
+      base.recallRetry.attempts = clampInt(jsonOverride.recallRetry.attempts, 1, 10, base.recallRetry.attempts);
+      base.recallRetry.backoffMs = clampInt(jsonOverride.recallRetry.backoffMs, 0, 60_000, base.recallRetry.backoffMs);
+    }
+    if (jsonOverride.recallTimeoutMs !== undefined) {
+      base.recallTimeoutMs = clampInt(jsonOverride.recallTimeoutMs, 500, 60_000, base.recallTimeoutMs);
+    }
+  }
+  if (tomlOverride) {
+    if (tomlOverride.health_gate !== undefined) base.healthGate = normalizeHealthGate(tomlOverride.health_gate);
+    if (tomlOverride.recall_retry_attempts !== undefined) {
+      base.recallRetry.attempts = clampInt(tomlOverride.recall_retry_attempts, 1, 10, base.recallRetry.attempts);
+    }
+    if (tomlOverride.recall_retry_backoff_ms !== undefined) {
+      base.recallRetry.backoffMs = clampInt(tomlOverride.recall_retry_backoff_ms, 0, 60_000, base.recallRetry.backoffMs);
+    }
+    if (tomlOverride.recall_timeout_ms !== undefined) {
+      base.recallTimeoutMs = clampInt(tomlOverride.recall_timeout_ms, 500, 60_000, base.recallTimeoutMs);
+    }
+  }
+  return base;
+}
+
+function loadSettings(): HindsightSettings {
+  let json: Partial<HindsightSettings> | null = null;
+  try {
+    if (existsSync(SETTINGS_PATH)) {
+      json = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8")) as Partial<HindsightSettings>;
+    }
+  } catch (e) {
+    log(`settings: failed to parse ${SETTINGS_PATH}: ${e}`);
+  }
+  // TOML keys come from resolveConfig() via the same flat parser.
+  // We re-parse the merged TOML chain here so settings can override per-project.
+  let toml: Record<string, string> | null = null;
+  try {
+    const configs: Record<string, string>[] = [];
+    let dir = process.cwd();
+    while (true) {
+      const cfg = parseToml(join(dir, ".hindsight", "config.toml"));
+      if (Object.keys(cfg).length) configs.push(cfg);
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    configs.reverse();
+    const userCfg = parseToml(join(homedir(), ".hindsight", "config.toml"));
+    if (Object.keys(userCfg).length) configs.unshift(userCfg);
+    const merged: Record<string, string> = {};
+    for (const cfg of configs) Object.assign(merged, cfg);
+    if (Object.keys(merged).length) toml = merged;
+  } catch { /* fall through to defaults */ }
+  return buildSettings(json, toml);
+}
+
+// Module-level health state. Reset on session_start, mutated by retain watcher
+// and recall handler. Process-wide (intentionally — one bad hindsight session
+// poisons all in-flight pi sessions for the same pgdata).
+interface HealthState {
+  healthy: boolean;
+  reason?: string;
+  markedAt?: string;
+}
+const healthState: HealthState = { healthy: true };
+
+export function markUnhealthy(reason: string): void {
+  if (healthState.healthy) {
+    healthState.healthy = false;
+    healthState.reason = reason;
+    healthState.markedAt = new Date().toISOString();
+    log(`health: marked UNHEALTHY (${reason})`);
+  }
+}
+
+export function markHealthy(): void {
+  if (!healthState.healthy) {
+    log(`health: clearing UNHEALTHY (was: ${healthState.reason})`);
+  }
+  healthState.healthy = true;
+  healthState.reason = undefined;
+  healthState.markedAt = undefined;
+}
+
+export function getHealthState(): Readonly<HealthState> {
+  return healthState;
+}
+
+/**
+ * Per-call recall with retry + circuit-breaker for a single bank.
+ * Exported for direct unit testing.
+ *
+ * Returns:
+ *   { outcome: "ok", data }      — HTTP 200, body parsed
+ *   { outcome: "empty-ok" }       — HTTP 200 but server unreachable from JSON
+ *   { outcome: "auth-failed" }    — HTTP 401/403, NOT retried
+ *   { outcome: "error" }          — exhausted retries, last error type recorded
+ *
+ * Retries on: timeout, network error (TypeError/AbortError), HTTP 5xx.
+ * Does not retry on: 4xx other than 408/429.
+ */
+export type RecallBankOutcome =
+  | { outcome: "ok"; data: { results?: Array<{ text: string }> } }
+  | { outcome: "auth-failed"; status: number }
+  | { outcome: "error"; attempts: number; lastErrorKind: string };
+
+export interface RecallRetryOpts {
+  attempts: number;
+  backoffMs: number;
+  timeoutMs: number;
+}
+
+function classifyError(e: unknown): string {
+  if (e instanceof Error) {
+    if (e.name === "TimeoutError" || e.name === "AbortError") return "timeout";
+    if (/ECONNREFUSED|ECONNRESET|EAI_AGAIN|ENOTFOUND|fetch failed/.test(e.message)) return "network";
+    return e.name || "error";
+  }
+  return "unknown";
+}
+
+export async function recallBankWithRetry(
+  apiUrl: string,
+  apiKey: string,
+  bank: string,
+  body: unknown,
+  opts: RecallRetryOpts,
+  fetchImpl: typeof fetch = fetch,
+  sleepImpl: (ms: number) => Promise<void> = sleep,
+): Promise<RecallBankOutcome> {
+  let lastErrorKind = "none";
+  for (let attempt = 1; attempt <= Math.max(1, opts.attempts); attempt++) {
+    try {
+      const res = await fetchImpl(`${apiUrl}/v1/default/banks/${bank}/memories/recall`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeader(apiKey) },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(opts.timeoutMs),
+      });
+      if (res.status === 401 || res.status === 403) {
+        return { outcome: "auth-failed", status: res.status };
+      }
+      if (res.ok) {
+        let data: any = { results: [] };
+        try { data = await res.json(); } catch { /* tolerate empty body */ }
+        return { outcome: "ok", data };
+      }
+      // 5xx / 408 / 429 → retry; other 4xx → give up.
+      const retryable = res.status >= 500 || res.status === 408 || res.status === 429;
+      lastErrorKind = `http-${res.status}`;
+      if (!retryable) {
+        return { outcome: "error", attempts: attempt, lastErrorKind };
+      }
+    } catch (e) {
+      lastErrorKind = classifyError(e);
+    }
+    if (attempt < opts.attempts) {
+      // exponential backoff with cap
+      const wait = Math.min(opts.backoffMs * Math.pow(2, attempt - 1), 30_000);
+      await sleepImpl(wait);
+    }
+  }
+  return { outcome: "error", attempts: opts.attempts, lastErrorKind };
+}
 
 // ─── Extension ───────────────────────────────────────────────────────────
 
@@ -507,6 +743,15 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     if (d.bank) t += theme.fg("dim", ` → ${d.bank}`);
     if (typeof d.op_age_ms === "number") t += theme.fg("dim", ` (${Math.round(d.op_age_ms / 1000)}s)`);
     t += "\n" + theme.fg("dim", "  LLM extraction likely failed silently — check ~/Work/llm-mode.sh status");
+    return new Text(t, 0, 0);
+  });
+
+  pi.registerMessageRenderer("hindsight-blocked", (msg, _opt, theme) => {
+    const d = (msg.details as any) ?? {};
+    let t = theme.fg("error", "✗ Hindsight blocked");
+    if (d.reason) t += theme.fg("muted", ` — ${d.reason}`);
+    t += "\n" + theme.fg("dim", "  Turn aborted (healthGate=block). Run /hindsight reset after fixing upstream,");
+    t += "\n" + theme.fg("dim", "  or set hindsight.healthGate=\"warn\" in ~/.pi/agent/hindsight.json.");
     return new Text(t, 0, 0);
   });
 
@@ -683,9 +928,21 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
   // ─── Auto-Recall (before_agent_start) ──────────────────────────────
 
+  // Phase C changes vs Phase B:
+  //   1. Each per-bank fetch uses recallBankWithRetry() — N retries with
+  //      exponential backoff for transient errors (timeout/5xx/network).
+  //      4xx auth errors are NOT retried.
+  //   2. Default timeout is settings.recallTimeoutMs (5000ms, was 2000ms).
+  //      2000ms was too tight for cold-start recall (embed + similarity +
+  //      optional LLM rerank) — the root cause of the ⚠ retrying status.
+  //   3. The status bar only displays ⚠ retrying after the LAST retry has
+  //      failed, never between retries inside one before_agent_start call.
+  //   4. healthGate=block: if unhealthy AT ENTRY (from prior zero-facts
+  //      retain or auth failure), abort the turn before recall.
+  //   5. A successful recall flips healthState back to healthy — self-heals
+  //      if the upstream LLM gateway recovers between turns.
   pi.on("before_agent_start", async (_event, ctx) => {
     if (recallDone || recallAttempts >= MAX_RECALL_ATTEMPTS) return;
-    recallAttempts++;
 
     const config = resolveConfig(process.cwd());
     if (!config?.api_url) { recallAttempts = MAX_RECALL_ATTEMPTS; return; }
@@ -693,41 +950,73 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     const banks = getRecallBanks(config);
     if (!banks.length) { recallAttempts = MAX_RECALL_ATTEMPTS; return; }
 
-    const query = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
-    log(`recall: attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS}, banks=${banks.join(",")}`);
+    const settings = loadSettings();
 
-    // FIX 2: per-bank state — auth failure on one bank must not poison the
-    // others. Aggregate any successful results, only mark a specific bank as
-    // auth-failed, and bail out only when *all* banks failed auth (in which
-    // case there's nothing to retry).
+    // ─── Health Gate (block mode) ────────────────────
+    // Check BEFORE incrementing recallAttempts or making any network call so
+    // that re-runs after `/hindsight reset` start with a clean slate.
+    if (!healthState.healthy && settings.healthGate === "block") {
+      log(`health-gate: BLOCKING turn (reason=${healthState.reason})`);
+      ctx.ui.setStatus?.("hindsight", `✗ blocked: ${healthState.reason || "unhealthy"}`);
+      hookStats.recall = {
+        firedAt: new Date().toISOString(),
+        result: "failed",
+        detail: `blocked: ${healthState.reason || "unhealthy"}`,
+      };
+      try { ctx.abort?.(); } catch (e) { log(`health-gate: ctx.abort threw ${e}`); }
+      return {
+        message: {
+          customType: "hindsight-blocked",
+          content:
+            `Hindsight is UNHEALTHY (${healthState.reason || "unknown reason"}) and ` +
+            `hindsight.healthGate is "block". The turn was aborted to avoid running ` +
+            `without recall context. Fix the underlying hindsight issue (check ` +
+            `\`~/Work/llm-mode.sh status\` and \`docker logs hindsight --tail 50\`), ` +
+            `then run \`/hindsight reset\` to clear the unhealthy flag and retry. ` +
+            `Alternatively, set \`hindsight.healthGate="warn"\` (or "off") in ` +
+            `~/.pi/agent/hindsight.json to proceed without recall.`,
+          display: true,
+          details: { reason: healthState.reason, markedAt: healthState.markedAt },
+        },
+      };
+    }
+
+    recallAttempts++;
+    const query = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
+    log(`recall: attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS}, banks=${banks.join(",")}, retries=${settings.recallRetry.attempts}, timeout=${settings.recallTimeoutMs}ms`);
+
     type BankOutcome = "ok" | "auth-failed" | "error";
     const bankOutcomes = new Map<string, BankOutcome>();
     const allResults: string[] = [];
+    const recallBody = {
+      query,
+      budget: "mid",
+      query_timestamp: new Date().toISOString(),
+      types: config.recall_types,
+    };
 
     try {
       await Promise.all(banks.map(async (bank) => {
-        try {
-          const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories/recall`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", ...authHeader(config.api_key) },
-            body: JSON.stringify({ query, budget: "mid", query_timestamp: new Date().toISOString(), types: config.recall_types }),
-            signal: AbortSignal.timeout(2000),
-          });
-          if (res.status === 401 || res.status === 403) {
-            bankOutcomes.set(bank, "auth-failed");
-            log(`recall: bank=${bank} auth error (HTTP ${res.status}) — other banks unaffected`);
-            return;
-          }
-          if (!res.ok) {
-            bankOutcomes.set(bank, "error");
-            return;
-          }
+        const r = await recallBankWithRetry(
+          config.api_url,
+          config.api_key,
+          bank,
+          recallBody,
+          {
+            attempts: settings.recallRetry.attempts,
+            backoffMs: settings.recallRetry.backoffMs,
+            timeoutMs: settings.recallTimeoutMs,
+          },
+        );
+        if (r.outcome === "auth-failed") {
+          bankOutcomes.set(bank, "auth-failed");
+          log(`recall: bank=${bank} auth error (HTTP ${r.status})`);
+        } else if (r.outcome === "ok") {
           bankOutcomes.set(bank, "ok");
-          const data = await res.json();
-          for (const r of (data.results || [])) allResults.push(`[${bank}] ${r.text}`);
-        } catch (e) {
+          for (const m of (r.data.results || [])) allResults.push(`[${bank}] ${m.text}`);
+        } else {
           bankOutcomes.set(bank, "error");
-          log(`recall: bank=${bank} fetch error ${e}`);
+          log(`recall: bank=${bank} exhausted ${r.attempts} retries (last=${r.lastErrorKind})`);
         }
       }));
 
@@ -741,11 +1030,16 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         recallAttempts = MAX_RECALL_ATTEMPTS;
         hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "auth error" };
         ctx.ui.setStatus("hindsight", "✗ auth error");
+        if (settings.healthGate !== "off") markUnhealthy("auth error on all banks");
         return;
       }
 
       if (anyOk) {
         recallDone = true;
+        // Successful recall → self-heal. Clears unhealthy flag from a prior
+        // zero-facts retain or transient recall failure, so the user doesn't
+        // need to /hindsight reset once the upstream LLM gateway recovers.
+        markHealthy();
         if (allResults.length) {
           const detail = authFailedBanks.length
             ? `${allResults.length} memories (auth failed: ${authFailedBanks.join(",")})`
@@ -770,11 +1064,15 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         const isLast = recallAttempts >= MAX_RECALL_ATTEMPTS;
         hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: isLast ? "unreachable" : "retrying" };
         ctx.ui.setStatus("hindsight", isLast ? "✗ unreachable" : "⚠ retrying");
+        // Only mark unhealthy on the FINAL session attempt — transient
+        // failures during earlier turns shouldn't gate subsequent prompts.
+        if (isLast && settings.healthGate !== "off") markUnhealthy("recall exhausted retries");
       }
     } catch (e) {
       const isLast = recallAttempts >= MAX_RECALL_ATTEMPTS;
       ctx.ui.setStatus("hindsight", isLast ? "✗ unreachable" : "⚠ retrying");
       log(`recall: error ${e}`);
+      if (isLast && settings.healthGate !== "off") markUnhealthy("recall threw");
     }
   });
 
@@ -870,12 +1168,45 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   // ─── Commands ──────────────────────────────────────────────────────
 
   pi.registerCommand("hindsight", {
-    description: "Hindsight memory status. Usage: /hindsight [status|stats]",
+    description: "Hindsight memory status. Usage: /hindsight [status|stats|health|reset]",
     handler: async (args: any, ctx) => {
       const config = resolveConfig(process.cwd());
       if (!config) { ctx.ui.notify("Hindsight not configured — no .hindsight/config.toml in path.", "warning"); return; }
 
       const sub = typeof args === "string" ? args.trim() : "";
+
+      if (sub === "reset") {
+        const wasHealthy = healthState.healthy;
+        const prevReason = healthState.reason;
+        markHealthy();
+        recallDone = false;
+        recallAttempts = 0;
+        ctx.ui.setStatus?.("hindsight", `🧠 ${getActiveBank(config) || ""}`.trim() || undefined);
+        ctx.ui.notify(
+          wasHealthy
+            ? "Hindsight already healthy. Recall counter reset."
+            : `Hindsight unhealthy flag cleared (was: ${prevReason}). Recall counter reset.`,
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "health") {
+        const s = loadSettings();
+        const lines = [
+          `Health: ${healthState.healthy ? "✓ healthy" : `✗ unhealthy (${healthState.reason})`}`,
+          healthState.markedAt ? `Marked: ${healthState.markedAt}` : "",
+          "",
+          `Settings (~/.pi/agent/hindsight.json):`,
+          `  healthGate:      ${s.healthGate}`,
+          `  recallRetry:     attempts=${s.recallRetry.attempts}, backoffMs=${s.recallRetry.backoffMs}`,
+          `  recallTimeoutMs: ${s.recallTimeoutMs}`,
+          "",
+          `Reset with: /hindsight reset`,
+        ].filter(Boolean);
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
 
       if (sub === "status") {
         const lines: string[] = [];
@@ -899,6 +1230,13 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           } catch { lines.push("Bank auth: ✗ unreachable"); }
         }
 
+        lines.push("");
+        lines.push(`Health: ${healthState.healthy ? "✓ healthy" : `✗ unhealthy (${healthState.reason})`}`);
+        const settings = loadSettings();
+        lines.push(`Gate:   ${settings.healthGate}`);
+        if (settings.healthGate === "block" && !healthState.healthy) {
+          lines.push("  • next prompt will be aborted — run /hindsight reset after fixing upstream");
+        }
         lines.push("");
         lines.push("Hooks:");
         const icon = (r?: string) => r === "ok" ? "✓" : r === "failed" ? "✗" : "…";
@@ -936,7 +1274,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui.notify(`Bank: ${getActiveBank(config) || "none"}\nGlobal: ${config.global_bank || "none"}\nRecall: ${getRecallBanks(config).join(", ")}\n/hindsight status | stats`, "info");
+      ctx.ui.notify(`Bank: ${getActiveBank(config) || "none"}\nGlobal: ${config.global_bank || "none"}\nRecall: ${getRecallBanks(config).join(", ")}\nHealth: ${healthState.healthy ? "✓" : `✗ ${healthState.reason}`}\n/hindsight status | stats | health | reset`, "info");
     },
   });
 }

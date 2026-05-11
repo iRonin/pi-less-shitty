@@ -8,7 +8,8 @@ Integrates [Hindsight](https://github.com/vectorize-io/hindsight) into the Pi co
 - **Auto-retain** — After each agent turn, the conversation is saved to Hindsight (delta-only, append mode)
 - **Domain-aware isolation** — Memory is scoped by project via `.hindsight/config.toml` files with parent-traversal
 - **Manual tools** — `hindsight_recall`, `hindsight_retain`, `hindsight_reflect` for explicit control
-- **Commands** — `/hindsight status` and `/hindsight stats` for monitoring
+- **Commands** — `/hindsight status`, `/hindsight stats`, `/hindsight health`, `/hindsight reset` for monitoring and recovery
+- **Health gate** (Phase C) — opt-in policy that blocks new prompts when hindsight silently fails, so you don't keep losing memory writes without noticing
 
 ## Prerequisites
 
@@ -88,6 +89,45 @@ In Pi, run:
 ```
 
 Should show bank name, server health, and hook status.
+
+## Robustness settings (Phase C)
+
+User-tunable via `~/.pi/agent/hindsight.json`. Project-scoped overrides via flat snake_case keys in `.hindsight/config.toml` (project values win over user-wide JSON).
+
+```json
+{
+  "healthGate": "warn",
+  "recallRetry": { "attempts": 3, "backoffMs": 1000 },
+  "recallTimeoutMs": 5000
+}
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `healthGate` | `"warn"` | `"off"` — never warns or blocks. `"warn"` — status bar only (current behavior). `"block"` — abort the next turn (calls `ctx.abort()`) if hindsight is unhealthy, with an injected message explaining how to recover. |
+| `recallRetry.attempts` | `3` | Per-call retry attempts on transient errors (timeout, 5xx, network). Clamped 1–10. |
+| `recallRetry.backoffMs` | `1000` | Initial backoff between retries; doubles each attempt, capped at 30s. Clamped 0–60000. |
+| `recallTimeoutMs` | `5000` | Per-attempt timeout in ms (bumped from pre-Phase-C 2000ms — the root cause of the persistent `⚠ retrying` status bar; production recall against a real bank with remote LLM rerank typically takes 2.0–2.4s). Clamped 500–60000. |
+
+### What marks hindsight UNHEALTHY?
+
+- A zero-facts retain detected by Phase B's background watcher (silent LLM failure)
+- Auth error (HTTP 401/403) on every configured bank during recall
+- Recall exhausted all retries on the FINAL session attempt
+
+### What clears UNHEALTHY?
+
+- A subsequent successful recall (self-heal once the upstream LLM gateway recovers)
+- `/hindsight reset` (manual override after fixing the root cause)
+
+### Equivalent TOML keys (project scope)
+
+```toml
+health_gate = "block"
+recall_retry_attempts = "3"
+recall_retry_backoff_ms = "1000"
+recall_timeout_ms = "5000"
+```
 
 ## Opt-out
 
