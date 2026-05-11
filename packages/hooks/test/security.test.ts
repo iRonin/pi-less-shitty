@@ -2,7 +2,9 @@
  * Security regression tests for pi-ironin-hooks.
  *
  * These tests cover the 10 bugs documented in the security audit:
- *   1.  Hard-block check ordering (hard block before session allowlist)
+ *   1.  Allowlist/hard-block contract (UPDATED): exact-literal allowlist
+ *       bypass beats hard-block; hardBlockMatch itself remains a pure
+ *       pattern check that ignores the allowlist.
  *   2.  Allowlist literal-equality (no unanchored regex)
  *   3.  pdfinfo invocation without shell
  *   4.  Wrapper-bypass tokenisation (bash -c, eval, xargs, git -C, pipe-to-shell)
@@ -25,10 +27,13 @@ import {
   splitChainedCommands,
 } from "../src/index.js";
 import {
+  _resetNowForTests,
   _sessionAllowlistSnapshot,
+  _setNowForTests,
   addToSessionAllowlist,
   clearSessionAllowlist,
   isSessionAllowed,
+  SESSION_ALLOWLIST_TTL_MS,
 } from "../src/permission-ui.js";
 import { addRule, hooksFilePath } from "../src/config-store.js";
 
@@ -216,22 +221,170 @@ describe("session allowlist — bug 2 literal equality", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Bug 1 — ordering: a session-allowlisted entry CANNOT shadow a hard block
+// Bug 1 (UPDATED contract) — allowlist/hard-block layering.
+//
+// Old behaviour: hard-block always wins. That meant the user could click
+// Approve in notify_user and STILL get blocked on the exact command they
+// approved — the UX bug reported by the user.
+//
+// New behaviour: the bash handler checks the session allowlist BEFORE
+// hard-block, so an explicit Approve grants a one-shot 60s bypass for
+// the EXACT literal command string. `hardBlockMatch` itself remains a
+// pure pattern function that ignores the allowlist.
 // ---------------------------------------------------------------------------
 
-describe("ordering — bug 1: hard block beats session allowlist", () => {
+describe("hardBlockMatch — pure pattern check (ignores allowlist)", () => {
   beforeEach(() => clearSessionAllowlist());
   afterEach(() => clearSessionAllowlist());
 
-  it("hard block fires even if exact command is allowlisted", () => {
-    // The allowlist is irrelevant to the hard-block check itself, so we
-    // assert the hard-block check returns a reason regardless of whether
-    // the same string happens to be in the allowlist. The main handler
-    // calls hardBlockMatch BEFORE consulting isSessionAllowed (see Pass 1
-    // in src/index.ts).
+  it("hardBlockMatch still returns a reason when command is allowlisted (handler decides ordering)", () => {
+    // hardBlockMatch is a pure function. The handler chooses whether
+    // to call it before or after the allowlist check — see Pass 1 in
+    // src/index.ts. Under the new contract the handler checks the
+    // allowlist FIRST.
     addToSessionAllowlist("sudo rm -rf /");
     expect(hardBlockMatch("sudo rm -rf /")).toMatch(/sudo/);
     expect(hardBlockMatch("git -C /tmp checkout main")).toMatch(/checkout/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// New: session allowlist TTL (60s) — exactly-once Approve semantics.
+// ---------------------------------------------------------------------------
+
+describe("session allowlist — 60s TTL", () => {
+  let t = 1_000_000;
+  beforeEach(() => {
+    clearSessionAllowlist();
+    t = 1_000_000;
+    _setNowForTests(() => t);
+  });
+  afterEach(() => {
+    clearSessionAllowlist();
+    _resetNowForTests();
+  });
+
+  it("approve is honoured for SESSION_ALLOWLIST_TTL_MS", () => {
+    addToSessionAllowlist("git push --force origin main");
+    expect(isSessionAllowed("git push --force origin main")).toBe(true);
+    t += SESSION_ALLOWLIST_TTL_MS - 1;
+    expect(isSessionAllowed("git push --force origin main")).toBe(true);
+  });
+
+  it("approve EXPIRES after SESSION_ALLOWLIST_TTL_MS", () => {
+    addToSessionAllowlist("git push --force origin main");
+    t += SESSION_ALLOWLIST_TTL_MS + 1;
+    expect(isSessionAllowed("git push --force origin main")).toBe(false);
+    // Expired entry is pruned, not silently retained.
+    expect(_sessionAllowlistSnapshot()).toEqual([]);
+  });
+
+  it("re-approving refreshes the TTL", () => {
+    addToSessionAllowlist("git push --force origin main");
+    t += SESSION_ALLOWLIST_TTL_MS - 1;
+    addToSessionAllowlist("git push --force origin main");
+    t += SESSION_ALLOWLIST_TTL_MS - 1;
+    expect(isSessionAllowed("git push --force origin main")).toBe(true);
+  });
+
+  it("approval for `git push --force X` does NOT cover `git push --force Y` (no fragment match)", () => {
+    addToSessionAllowlist("git push --force origin main");
+    expect(isSessionAllowed("git push --force origin main")).toBe(true);
+    expect(isSessionAllowed("git push --force origin dev")).toBe(false);
+    expect(isSessionAllowed("git push --force")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// New: handler-equivalent ordering test. Mirrors the bash handler's
+// decision tree from src/index.ts so a regression in that ordering
+// surfaces here. This is the *intent* test for the user-reported UX
+// bug: "Approve → same command → HARD BLOCK".
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirror of the bash handler's check ordering from src/index.ts.
+ * Returns either `{ allow: true }` or `{ block: true, reason }`.
+ * If this drifts from the real handler the test no longer encodes
+ * intent — keep it in sync.
+ */
+function simulateBashHandler(command: string): { allow: true } | { block: true; reason: string } {
+  // Top-of-handler full-command allowlist bypass.
+  if (isSessionAllowed(command.trim())) return { allow: true };
+
+  const split = splitChainedCommands(command);
+  if (split.unparsable) return { block: true, reason: "HARD BLOCK: unparsable" };
+
+  // Pass 1: per-part allowlist first, then hard-block.
+  for (const part of split.parts) {
+    const cmd = part.cmd;
+    if (!cmd) continue;
+    if (isSessionAllowed(cmd)) continue;
+    const hb = hardBlockMatch(cmd);
+    if (hb) return { block: true, reason: `HARD BLOCK: ${hb}` };
+  }
+  return { allow: true };
+}
+
+describe("bash handler ordering — Approve bypasses hard-block on exact match", () => {
+  let t = 1_000_000;
+  beforeEach(() => {
+    clearSessionAllowlist();
+    t = 1_000_000;
+    _setNowForTests(() => t);
+  });
+  afterEach(() => {
+    clearSessionAllowlist();
+    _resetNowForTests();
+  });
+
+  it("unapproved `git push --force` is hard-blocked", () => {
+    const r = simulateBashHandler("git push --force origin main");
+    expect(r).toMatchObject({ block: true });
+    if ("reason" in r) expect(r.reason).toMatch(/force-pushing/);
+  });
+
+  it("approved `git push --force` (exact string) bypasses hard-block within TTL", () => {
+    addToSessionAllowlist("git push --force origin main");
+    const r = simulateBashHandler("git push --force origin main");
+    expect(r).toEqual({ allow: true });
+  });
+
+  it("approving X does NOT silently approve Y (different remote/branch)", () => {
+    addToSessionAllowlist("git push --force origin main");
+    const r = simulateBashHandler("git push --force origin dev");
+    expect(r).toMatchObject({ block: true });
+  });
+
+  it("approval expires after 60s — re-running the same command is hard-blocked again", () => {
+    addToSessionAllowlist("git push --force origin main");
+    expect(simulateBashHandler("git push --force origin main")).toEqual({ allow: true });
+    t += SESSION_ALLOWLIST_TTL_MS + 1;
+    const r = simulateBashHandler("git push --force origin main");
+    expect(r).toMatchObject({ block: true });
+  });
+
+  it("approval of an inner chain part bypasses hard-block for THAT part only", () => {
+    addToSessionAllowlist("git push --force origin main");
+    // The full chained command isn't in the allowlist; the part is.
+    // Pass 1 sees `echo ok` (no hard-block) and `git push --force origin main`
+    // (allowlisted), so the full chain is allowed.
+    const r = simulateBashHandler("echo ok && git push --force origin main");
+    expect(r).toEqual({ allow: true });
+  });
+
+  it("approval does NOT cover a different destructive verb in the same chain", () => {
+    addToSessionAllowlist("git push --force origin main");
+    const r = simulateBashHandler("git push --force origin main && git checkout HEAD~1");
+    expect(r).toMatchObject({ block: true });
+    if ("reason" in r) expect(r.reason).toMatch(/checkout/);
+  });
+
+  it("sudo remains hard-blocked even with similar approved commands present", () => {
+    addToSessionAllowlist("echo hello");
+    const r = simulateBashHandler("sudo rm -rf /");
+    expect(r).toMatchObject({ block: true });
+    if ("reason" in r) expect(r.reason).toMatch(/sudo/);
   });
 });
 

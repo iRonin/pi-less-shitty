@@ -86,13 +86,34 @@ function registerNotifyUser(pi: ExtensionAPI): void {
       // allowlist. We deliberately do NOT splatter split subcommands here:
       // the previous behaviour combined with regex matching meant that
       // approving e.g. `git status; rm -rf /` would also approve the bare
-      // `rm -rf /` fragment for any future call.
+      // `rm -rf /` fragment for any future call. The allowlist entry has a
+      // 60s TTL so a single Approve cannot keep bypassing hard-blocks
+      // indefinitely — see permission-ui.ts.
       if ((choice === "Approve") && opts.command) {
         addToSessionAllowlist(opts.command);
       }
 
+      // Tool-result text drives the agent's next action. We make Steer
+      // and Deny emphatic so the LLM doesn't blow past them. The
+      // canonical contract is also documented in the cascading
+      // APPEND_SYSTEM.md (notify_user response handling section).
+      let text: string;
+      if (choice === "Steer") {
+        text =
+          `🛑 User chose: **Steer** — STOP all action. Do NOT execute any further tool calls. ` +
+          `Reply with ONE short sentence asking the user what to adjust, then await their steering input before proceeding.`;
+      } else if (choice === "Deny") {
+        text =
+          `❌ User chose: **Deny** — abandon this operation entirely. Do NOT retry, do NOT work around it. ` +
+          `Acknowledge to the user and stop.`;
+      } else if (choice === "Approve") {
+        text = `✅ User chose: **Approve** — proceed with the exact approved command without further confirmation.`;
+      } else {
+        text = `User chose: **${choice}**`;
+      }
+
       return {
-        content: [{ type: "text" as const, text: `User chose: **${choice}**` }],
+        content: [{ type: "text" as const, text }],
         details: { choice },
       };
     },
@@ -665,6 +686,26 @@ export default function (pi: ExtensionAPI) {
 
     const projectRoot = findProjectRoot(ctx.cwd);
     const config = findHooksConfig(ctx.cwd);
+
+    // ------------------------------------------------------------------
+    // Top-of-handler full-command allowlist check.
+    //
+    // When the user clicks Approve in notify_user, the EXACT command
+    // string (including any `&&`/`;`/`|` chain) is stored verbatim in
+    // the session allowlist with a 60s TTL. If the very next bash call
+    // matches that string literally, we bypass ALL further analysis —
+    // including hard-blocks. The user just saw and approved this exact
+    // text; re-blocking it is the bug the user reported.
+    //
+    // Tight-scoping properties:
+    //   - exact literal match (no regex, no fragments)
+    //   - 60s TTL (single-shot in practice)
+    //   - per-session (cleared on session_start)
+    // ------------------------------------------------------------------
+    if (isSessionAllowed(command.trim())) {
+      return undefined;
+    }
+
     const split = splitChainedCommands(command);
 
     // Refuse inputs containing dynamic substitution / heredocs / unbalanced
@@ -678,8 +719,9 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
-    // Pass 1: Hard blocks first (they cannot be overridden by the session
-    // allowlist), then session allowlist, then rm → trash rewrite.
+    // Pass 1: per-part allowlist check first, then hard blocks, then rm →
+    // trash rewrite. Per-part allowlist also bypasses hard-blocks because
+    // the user explicitly approved that exact sub-command via notify_user.
     let needsRewrite = false;
     const rewrittenParts: ChainPart[] = [];
 
@@ -687,8 +729,15 @@ export default function (pi: ExtensionAPI) {
       const cmd = part.cmd;
       if (!cmd) { rewrittenParts.push(part); continue; }
 
-      // Hard blocks FIRST — must run before allowlist so an approved
-      // entry cannot shadow a destructive operation.
+      // Session allowlist FIRST — an explicit Approve for this exact
+      // sub-command bypasses hard-blocks. The TTL (60s) plus exact
+      // literal match keeps this tight.
+      if (isSessionAllowed(cmd)) {
+        rewrittenParts.push(part);
+        continue;
+      }
+
+      // Hard blocks next.
       const hb = hardBlockMatch(cmd);
       if (hb) return { block: true, reason: `HARD BLOCK: ${hb}` };
 
@@ -699,12 +748,6 @@ export default function (pi: ExtensionAPI) {
           block: true,
           reason: `HARD BLOCK: piped to shell (\`${cmd}\`) — never allowed. This pattern is the canonical curl-to-shell foot-gun.`,
         };
-      }
-
-      // Session allowlist — approved commands skip remaining checks.
-      if (isSessionAllowed(cmd)) {
-        rewrittenParts.push(part);
-        continue;
       }
 
       // rm → trash rewrite
@@ -723,19 +766,20 @@ export default function (pi: ExtensionAPI) {
       event.input.command = joinChain(rewrittenParts);
     }
 
-    // Pass 2: Re-run hard-block check on the (possibly rewritten) parts and
-    // then run the destructive-context analysis. We re-run hard blocks
-    // here because a rewrite, allowlist hit, or future change could in
-    // principle reshape what we're about to dispatch.
+    // Pass 2: Re-run allowlist + hard-block check on the (possibly
+    // rewritten) parts and then run the destructive-context analysis.
+    // We re-run hard blocks here because a rewrite, allowlist hit, or
+    // future change could in principle reshape what we're about to
+    // dispatch.
     for (const part of rewrittenParts) {
       const trimmed = part.cmd;
       if (!trimmed) continue;
 
+      // Session allowlist first — mirrors Pass 1 ordering.
+      if (isSessionAllowed(trimmed)) continue;
+
       const hb = hardBlockMatch(trimmed);
       if (hb) return { block: true, reason: `HARD BLOCK: ${hb}` };
-
-      // Session allowlist
-      if (isSessionAllowed(trimmed)) continue;
 
       // .pi-hooks.json rules → user override
       if (config) {
@@ -790,11 +834,16 @@ export default function (pi: ExtensionAPI) {
 
     const safetyGuidelines = `\n\n## Command Safety Guidelines
 - Use \`trash\` instead of \`rm\` for files outside /tmp (automatic rewrite is in place, but prefer trash explicitly)
-- **ALL destructive git commands are HARD BLOCKED**: checkout, reset, clean, rebase, push --force, branch -D, stash drop/clear
-- If you need to perform a destructive git operation, explain why and call \`notify_user\` with the command — do NOT try to work around the block
+- **Destructive git commands are HARD BLOCKED**: checkout, reset, clean, rebase, push --force, branch -D, stash drop/clear
+- To run a destructive command: call \`notify_user\` with the EXACT command string. If the user clicks Approve, the very next bash call with that exact command bypasses the hard-block for 60 seconds. Do NOT alter the command between Approve and the bash call — even one character of drift breaks the literal match.
 - /tmp, /private/tmp, and ~/Downloads are always safe for writes and deletions
 - If you're unsure whether a command is safe, use the \`notify_user\` tool to confirm — always pass the \`command\` parameter so the user sees what will run
-- Prefer \`kill\` (SIGTERM) over \`kill -9\` (SIGKILL) unless the process is unresponsive`;
+- Prefer \`kill\` (SIGTERM) over \`kill -9\` (SIGKILL) unless the process is unresponsive
+
+## notify_user response handling
+- **Approve**: proceed with the EXACT approved command without further confirmation. Do not modify it.
+- **Steer**: STOP. Do not execute any further tool calls. Reply with ONE short sentence asking the user what to adjust, then wait for their input.
+- **Deny**: abandon the operation entirely. Do not retry, do not work around it.`;
 
     event.systemPrompt += safetyGuidelines;
   });
