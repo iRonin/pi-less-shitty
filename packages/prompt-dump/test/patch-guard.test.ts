@@ -109,7 +109,9 @@ describe("prompt-dump patchMainJs", () => {
 		expect(argsAfter).toContain('arg === "--prompt-dump-dry"');
 		expect(argsAfter).toContain('arg === "--prompt-dump-json"');
 		expect(argsAfter).toContain('arg === "--prompt-dump-section"');
+		expect(argsAfter).toContain('arg === "--prompt-dump-grep"');
 		expect(argsAfter).toContain("result.promptDumpSection = args[++i]");
+		expect(argsAfter).toContain("result.promptDumpGrep = args[++i]");
 
 		// runtime copied next to main.js
 		const runtimeDest = path.join(distDir, "_prompt-dump-runtime.js");

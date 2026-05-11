@@ -9,6 +9,15 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// When this module is dynamically imported from the patched main.js, the
+// runtime file lives at <distDir>/_prompt-dump-runtime.js — so its own
+// directory IS the dist root. Cache it for cascade-state lookup.
+const SELF_DIR = (() => {
+	try { return path.dirname(fileURLToPath(import.meta.url)); }
+	catch { return null; }
+})();
 
 // `chalk` is injected by the caller (passed through opts.chalk in runPromptDump)
 // so this module stays importable in tests where chalk may not be installed
@@ -23,6 +32,22 @@ const CONTEXT_CANDIDATES = ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
  * returns the discovery shape without touching the real filesystem if fsImpl
  * is overridden in tests.
  */
+/**
+ * Detect whether the cascading-append-system patch is currently applied to
+ * pi's `core/resource-loader.js`. Returns null when the dist can't be located
+ * (don't pretend to know in that case).
+ */
+export function detectCascadeAppendActive({ piDistDir, fsImpl = fs } = {}) {
+	if (!piDistDir) return null;
+	const loaderPath = path.join(piDistDir, "core", "resource-loader.js");
+	try {
+		const c = fsImpl.readFileSync(loaderPath, "utf8");
+		return c.includes("@ironin/pi-cascading-append-system");
+	} catch {
+		return null;
+	}
+}
+
 export function discoverContext({ cwd, agentDir, fsImpl = fs }) {
 	const exists = (p) => {
 		try { return fsImpl.existsSync(p); } catch { return false; }
@@ -300,9 +325,14 @@ export function buildVerification({ discovery, sections, loadedAppendPresent, lo
 				: "APPEND_SYSTEM.md: <no candidates on disk>",
 		});
 	} else if (loadedCount === existingAppendPaths.length) {
+		const suffix = discovery.cascadeAppendActive === true
+			? " (CASCADE active)"
+			: discovery.cascadeAppendActive === false
+				? " (stock pi single-match — trivially matches since only 1 candidate exists)"
+				: "";
 		out.push({
 			ok: true,
-			msg: `APPEND_SYSTEM.md cascade: ${loadedCount}/${existingAppendPaths.length} loaded (CASCADE active)`,
+			msg: `APPEND_SYSTEM.md cascade: ${loadedCount}/${existingAppendPaths.length} loaded${suffix}`,
 		});
 	} else if (loadedCount === 1 && existingAppendPaths.length > 1) {
 		out.push({
@@ -324,6 +354,15 @@ export function buildVerification({ discovery, sections, loadedAppendPresent, lo
 }
 
 // ── ANSI helpers ────────────────────────────────────────────────────────
+// Kind-only colorisers (raw, no chalk). Used by grep output where each
+// matching line is already truncated to a single line; we just want a stable
+// hue per section kind without bleeding bg colours.
+const KIND_COLOR_RAW = {
+	// These get rebound to chalk colour functions inside runPromptDump where
+	// chalk is available; left here as identity so module-top references don't
+	// crash when chalk is not yet injected.
+};
+
 // Factories that take an injected chalk and return the per-kind colorisers.
 function kindColors(chalk) {
 	return {
@@ -373,18 +412,20 @@ function renderDiscovery(discovery, chalk, fsImpl = fs) {
 	}
 	if (!usedSystem) out.push(`    ${chalk.green("✓ used   ")} ${chalk.dim("<built-in base>")}`);
 
-	// APPEND_SYSTEM.md — cascading-append-system extension enables full cascade.
+	// APPEND_SYSTEM.md — authoritative cascade-state detection comes from
+	// reading the dist patch marker (discovery.cascadeAppendActive). Falling
+	// back to a count heuristic when dist lookup failed.
 	out.push("");
 	const loadedAllSet = new Set(discovery.appendMdLoadedAll || []);
-	const cascadeMode = loadedAllSet.size > 1;
-	out.push(
-		chalk.bold("  APPEND_SYSTEM.md ") +
-			chalk.dim(
-				cascadeMode
-					? "(CASCADE active — all matches loaded, agentDir + cwd → root)"
-					: "(stock pi: first match wins — install @ironin/pi-cascading-append-system to cascade)",
-			),
-	);
+	const cascadeActive = discovery.cascadeAppendActive === true
+		? true
+		: discovery.cascadeAppendActive === false
+			? false
+			: loadedAllSet.size > 1; // fallback: only deduceable from >1 loaded files
+	const headerNote = cascadeActive
+		? "CASCADE active (@ironin/pi-cascading-append-system patched resource-loader.js) — ALL matches loaded"
+		: "stock pi (single-match) — install @ironin/pi-cascading-append-system to cascade ancestors";
+	out.push(chalk.bold("  APPEND_SYSTEM.md ") + chalk.dim("(" + headerNote + ")"));
 	for (const c of discovery.appendMdCandidates) {
 		const ex = fsImpl.existsSync(c.path);
 		let marker;
@@ -480,6 +521,40 @@ function makeChalkStub() {
 	return make();
 }
 
+/**
+ * Search the assembled prompt for `pattern` (regex string). Returns matches
+ * attributed to the section they fall in. Pure-ish: takes pre-split sections
+ * + the raw sysPrompt, returns a list of {kind, source, line, lineNumber,
+ * preview}. Exported so the patch wrapper can call it without re-running the
+ * splitter, and so tests can exercise it directly.
+ */
+export function grepSections({ sysPrompt, sections, pattern, ignoreCase = false }) {
+	let re;
+	try {
+		re = new RegExp(pattern, ignoreCase ? "gi" : "g");
+	} catch (err) {
+		return { error: `invalid regex: ${err.message}`, matches: [] };
+	}
+	const matches = [];
+	for (const s of sections) {
+		const body = sysPrompt.slice(s.start, s.end);
+		const lines = body.split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			re.lastIndex = 0;
+			const line = lines[i];
+			if (re.test(line)) {
+				matches.push({
+					kind: s.kind,
+					source: s.source,
+					lineNumber: i + 1, // 1-indexed within section
+					line,
+				});
+			}
+		}
+	}
+	return { error: null, matches };
+}
+
 function sectionMatchesFilter(section, filter) {
 	const f = filter.toLowerCase();
 	if (section.kind === f) return true;
@@ -502,6 +577,7 @@ export async function runPromptDump(opts) {
 	const chalk = opts.chalk || makeChalkStub();
 
 	const mode = parsed.promptDumpJson ? "json"
+		: parsed.promptDumpGrep !== undefined ? "grep"
 		: parsed.promptDumpDry ? "dry"
 		: parsed.promptDumpSection !== undefined ? "section"
 		: "full";
@@ -514,6 +590,9 @@ export async function runPromptDump(opts) {
 	const appendArr = resourceLoader.appendSystemPrompt || [];
 
 	const discovery = discoverContext({ cwd, agentDir });
+	discovery.cascadeAppendActive = detectCascadeAppendActive({
+		piDistDir: opts.piDistDir || SELF_DIR,
+	});
 	const { sections } = splitSections({
 		sysPrompt,
 		appendArr,
@@ -531,6 +610,63 @@ export async function runPromptDump(opts) {
 	});
 
 	// (chalk-using renderers initialised below)
+	KIND_COLOR_RAW.base = chalk.magenta;
+	KIND_COLOR_RAW.append = chalk.blue;
+	KIND_COLOR_RAW.context = chalk.cyan;
+	KIND_COLOR_RAW.skills = chalk.yellow;
+	KIND_COLOR_RAW.footer = chalk.gray;
+
+	if (mode === "grep") {
+		const pattern = typeof parsed.promptDumpGrep === "string" ? parsed.promptDumpGrep : "";
+		// Honour an inline (?i) flag the way grep -i would.
+		let ignoreCase = false;
+		let patternBody = pattern;
+		if (patternBody.startsWith("(?i)")) {
+			ignoreCase = true;
+			patternBody = patternBody.slice(4);
+		}
+		const { error, matches } = grepSections({
+			sysPrompt,
+			sections,
+			pattern: patternBody,
+			ignoreCase,
+		});
+		if (error) {
+			process.stderr.write(chalk.red(`prompt-dump-grep: ${error}\n`));
+			process.exitCode = 2;
+			return;
+		}
+		if (matches.length === 0) {
+			process.stderr.write(
+				chalk.dim(`prompt-dump-grep: no matches for /${patternBody}/${ignoreCase ? "i" : ""}\n`),
+			);
+			process.exitCode = 1;
+			return;
+		}
+		// Group by section for compact output.
+		const grouped = new Map();
+		for (const m of matches) {
+			const key = m.kind + "\t" + m.source;
+			if (!grouped.has(key)) grouped.set(key, []);
+			grouped.get(key).push(m);
+		}
+		const log = (s) => process.stdout.write(s + "\n");
+		log(
+			chalk.bold(`prompt-dump-grep`) +
+				chalk.dim(`  /${patternBody}/${ignoreCase ? "i" : ""}  — ${matches.length} match${matches.length === 1 ? "" : "es"} across ${grouped.size} section${grouped.size === 1 ? "" : "s"}`),
+		);
+		for (const [key, group] of grouped) {
+			const [kind, source] = key.split("\t");
+			const color = (KIND_COLOR_RAW[kind] || ((x) => x));
+			log("");
+			log(chalk.bold(`[${kind.toUpperCase()}]`) + "  " + chalk.cyan(shortenHome(source)) + chalk.dim(`  (${group.length} match${group.length === 1 ? "" : "es"})`));
+			for (const m of group) {
+				const ln = chalk.dim(String(m.lineNumber).padStart(5) + ":");
+				log(`  ${ln} ${color(m.line)}`);
+			}
+		}
+		return;
+	}
 
 	if (mode === "json") {
 		const out = {

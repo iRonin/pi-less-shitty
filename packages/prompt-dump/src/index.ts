@@ -37,17 +37,27 @@ function patchArgsJs(distDir: string): boolean {
 		"--prompt-dump-dry",
 		"--prompt-dump-json",
 		"--prompt-dump-section",
+		"--prompt-dump-grep",
 	];
 	if (wanted.every((flag) => c.includes(flag))) return true; // already patched (current shape)
 
 	// Strip any older partial patch so we re-insert a clean canonical block.
 	c = c.replace(
-		/\s*else if \(arg === "--prompt-dump(-dry|-json|-section)?"\) \{[\s\S]*?\}\s*\n/g,
+		/\s*else if \(arg === "--prompt-dump(-dry|-json|-section|-grep)?"\s*(?:&& i \+ 1 < args\.length\s*)?\) \{[\s\S]*?\}\s*\n/g,
 		"\n",
 	);
 	c = c.replace(
 		/\s*else if \(arg === "--prompt-dump"\) \{\s*result\.promptDump = true;\s*\}\s*\n/g,
 		"\n",
+	);
+	// Collapse any blank-line runs the cleanup left between offline's `}` and
+	// the `arg.startsWith("@")` anchor so the literal anchor below matches.
+	// Note: the `\s*\n` form is wrong here because `\s*` is greedy and would
+	// consume the very newline `\n+` needs to match. Use a literal `\}` followed
+	// by `\n+` and require an explicit re-emit of `\n` in the replacement.
+	c = c.replace(
+		/(\})\n+(\s*else if \(arg\.startsWith\("@"\))/,
+		"$1\n$2",
 	);
 
 	const anchor =
@@ -58,6 +68,7 @@ function patchArgsJs(distDir: string): boolean {
 		'        else if (arg === "--prompt-dump-dry") {\n            result.promptDumpDry = true;\n        }\n' +
 		'        else if (arg === "--prompt-dump-json") {\n            result.promptDumpJson = true;\n        }\n' +
 		'        else if (arg === "--prompt-dump-section" && i + 1 < args.length) {\n            result.promptDumpSection = args[++i];\n        }\n' +
+		'        else if (arg === "--prompt-dump-grep" && i + 1 < args.length) {\n            result.promptDumpGrep = args[++i];\n        }\n' +
 		'        else if (arg.startsWith("@"))';
 
 	if (!c.includes(anchor)) return false;
@@ -92,12 +103,12 @@ function patchMainJs(distDir: string): boolean {
 	const runtimeDest = copyRuntime(distDir);
 	if (!runtimeDest) return false;
 
-	// Tiny wrapper — dispatches all four flags to the runtime. `chalk` is
-	// imported at the top of main.js so we forward it to keep the runtime
-	// importable in test environments without chalk in node_modules.
+	// Tiny wrapper — dispatches all flags to the runtime. `chalk` is imported
+	// at the top of main.js so we forward it to keep the runtime importable
+	// in test environments without chalk in node_modules.
 	const wrapper =
 		'    // --- ' + HANDLER_MARKER + ' ---\n' +
-		'    if (parsed.promptDump || parsed.promptDumpDry || parsed.promptDumpJson || parsed.promptDumpSection !== undefined) {\n' +
+		'    if (parsed.promptDump || parsed.promptDumpDry || parsed.promptDumpJson || parsed.promptDumpSection !== undefined || parsed.promptDumpGrep !== undefined) {\n' +
 		'        await session.bindExtensions({});\n' +
 		'        const { runPromptDump } = await import("./' + RUNTIME_BASENAME + '");\n' +
 		'        await runPromptDump({ cwd, agentDir, session, resourceLoader, parsed, chalk });\n' +

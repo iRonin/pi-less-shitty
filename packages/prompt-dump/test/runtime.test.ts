@@ -5,7 +5,7 @@ import path from "node:path";
 
 // Import the runtime — pure JS, importable directly
 // @ts-expect-error — runtime.js is plain JS
-import { discoverContext, splitSections, buildVerification, runPromptDump } from "../src/runtime.js";
+import { discoverContext, splitSections, buildVerification, runPromptDump, detectCascadeAppendActive, grepSections } from "../src/runtime.js";
 
 function tmpdir() {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "prompt-dump-runtime-"));
@@ -292,6 +292,114 @@ describe("buildVerification", () => {
 		};
 		const v = buildVerification({ discovery, sections: [], loadedAppendPresent: false, loaderSystemPrompt: undefined });
 		expect(v.every((x: any) => x.ok)).toBe(true);
+	});
+});
+
+describe("detectCascadeAppendActive", () => {
+	it("returns null when piDistDir is missing or unreadable", () => {
+		expect(detectCascadeAppendActive({})).toBeNull();
+		expect(detectCascadeAppendActive({ piDistDir: "/nonexistent/dist" })).toBeNull();
+	});
+
+	it("returns true when the marker is present", () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cascade-detect-"));
+		try {
+			fs.mkdirSync(path.join(tmp, "core"));
+			fs.writeFileSync(
+				path.join(tmp, "core", "resource-loader.js"),
+				'discoverAppendSystemPromptFile() { /* PATCHED by @ironin/pi-cascading-append-system */ }',
+				"utf8",
+			);
+			expect(detectCascadeAppendActive({ piDistDir: tmp })).toBe(true);
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("returns false when resource-loader.js exists without the marker", () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cascade-detect-neg-"));
+		try {
+			fs.mkdirSync(path.join(tmp, "core"));
+			fs.writeFileSync(
+				path.join(tmp, "core", "resource-loader.js"),
+				"// stock pi resource loader\n",
+				"utf8",
+			);
+			expect(detectCascadeAppendActive({ piDistDir: tmp })).toBe(false);
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("grepSections", () => {
+	const sys =
+		"BASE LINE ONE\n" +
+		"base line two with banana\n\n" +
+		"# Project Context\n\nProject-specific instructions and guidelines:\n\n" +
+		"## /a/CLAUDE.md\n\nfirst context with Banana fruit\nplain line\n\n" +
+		"## /b/CLAUDE.md\n\nbanana again\n\n" +
+		"\nCurrent date: 2026-05-11\nCurrent working directory: /tmp";
+	const built = splitSections({
+		sysPrompt: sys,
+		appendArr: [],
+		systemMdLoaded: null,
+		appendMdLoaded: null,
+	});
+
+	it("attributes matches to their section kind and source", () => {
+		// `[Bb]anana` to match both uppercase BANANA and lowercase banana
+		// across all three sections (base, /a context, /b context).
+		const { matches } = grepSections({ sysPrompt: sys, sections: built.sections, pattern: "[Bb]anana" });
+		const kinds = matches.map((m: any) => m.kind);
+		const sources = matches.map((m: any) => m.source);
+		expect(kinds).toContain("base");
+		expect(kinds).toContain("context");
+		expect(sources).toContain("/a/CLAUDE.md");
+		expect(sources).toContain("/b/CLAUDE.md");
+	});
+
+	it("is case-sensitive by default", () => {
+		const { matches } = grepSections({
+			sysPrompt: sys,
+			sections: built.sections,
+			pattern: "Banana",
+		});
+		// Only the line containing capital-B Banana in the first context entry.
+		expect(matches).toHaveLength(1);
+		expect(matches[0].kind).toBe("context");
+		expect(matches[0].source).toBe("/a/CLAUDE.md");
+	});
+
+	it("honours ignoreCase", () => {
+		const { matches } = grepSections({
+			sysPrompt: sys,
+			sections: built.sections,
+			pattern: "banana",
+			ignoreCase: true,
+		});
+		// All three banana/Banana occurrences (one base, two context entries).
+		expect(matches.length).toBeGreaterThanOrEqual(3);
+	});
+
+	it("returns an error object for invalid regexes", () => {
+		const { error, matches } = grepSections({
+			sysPrompt: sys,
+			sections: built.sections,
+			pattern: "[unterminated",
+		});
+		expect(error).toMatch(/invalid regex/);
+		expect(matches).toHaveLength(0);
+	});
+
+	it("line numbers are 1-indexed within the section", () => {
+		const { matches } = grepSections({
+			sysPrompt: sys,
+			sections: built.sections,
+			pattern: "plain line",
+		});
+		expect(matches).toHaveLength(1);
+		expect(matches[0].lineNumber).toBeGreaterThanOrEqual(1);
 	});
 });
 
