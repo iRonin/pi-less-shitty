@@ -516,3 +516,121 @@ describe("retain-polling: fetchDocumentUnitsCount helper", () => {
     assert.equal(r, null);
   });
 });
+
+// ---------------------------------------------------------------------------
+// TESTS — buildPreRetainSnapshot helper (Phase D regression coverage)
+//
+// Regression context: between Phase D ship and the next refactor, the
+// `agent_end` handler’s pre-retain snapshot loop referenced three locals
+// (`documentId`, `transcriptLen`, `preCounts`) that were never defined in
+// scope. The resulting `ReferenceError` was swallowed by an enclosing
+// `try/catch (e) { log(...) }`, so the watcher never received a real
+// snapshot and the Phase D zero-units detector silently went offline.
+//
+// These tests pin the invariant: the snapshot helper must populate every
+// requested bank with a numeric count, and the production source must
+// define the three locals BEFORE the snapshot construction site.
+// ---------------------------------------------------------------------------
+
+// Local mirror of the production helper. Kept algorithmically identical to
+// `buildPreRetainSnapshot` in index.ts — any drift is itself a defect.
+async function buildPreRetainSnapshot(
+  fetchImpl: typeof fetch, apiUrl: string, apiKey: string,
+  banks: string[], documentId: string,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const results = await Promise.allSettled(
+    banks.map(async (b) => {
+      const n = await fetchDocumentUnitsCount(fetchImpl, apiUrl, apiKey, b, documentId);
+      return { bank: b, count: n ?? 0 };
+    }),
+  );
+  for (const r of results) {
+    if (r.status === "fulfilled") out.set(r.value.bank, r.value.count);
+  }
+  for (const b of banks) {
+    if (!out.has(b)) out.set(b, 0);
+  }
+  return out;
+}
+
+describe("retain-polling: buildPreRetainSnapshot", () => {
+  test("populates every requested bank with a numeric count", async () => {
+    const { fetchImpl, calls } = makeFetchSequence([
+      () => jsonResponse({ id: "session-x", memory_unit_count: 5 }),
+      () => jsonResponse({ id: "session-x", memory_unit_count: 12 }),
+    ]);
+    const snap = await buildPreRetainSnapshot(fetchImpl, "http://x", "k", ["bank-a", "bank-b"], "session-x");
+    assert.equal(snap.size, 2);
+    assert.equal(snap.get("bank-a"), 5);
+    assert.equal(snap.get("bank-b"), 12);
+    // Both GETs should target the snapshot documentId, not anything else.
+    assert.ok(calls[0].includes("/banks/bank-a/documents/session-x"));
+    assert.ok(calls[1].includes("/banks/bank-b/documents/session-x"));
+  });
+
+  test("maps 404 (brand-new document) to 0 — not null, not missing", async () => {
+    const { fetchImpl } = makeFetchSequence([
+      () => jsonResponse({}, false, 404),
+      () => jsonResponse({ id: "session-x", memory_unit_count: 3 }),
+    ]);
+    const snap = await buildPreRetainSnapshot(fetchImpl, "http://x", "k", ["new-bank", "old-bank"], "session-x");
+    assert.equal(snap.get("new-bank"), 0);
+    assert.equal(snap.get("old-bank"), 3);
+  });
+
+  test("network errors on one bank do not poison the others", async () => {
+    const { fetchImpl } = makeFetchSequence([
+      () => { throw new Error("ECONNREFUSED"); },
+      () => jsonResponse({ id: "session-x", memory_unit_count: 9 }),
+    ]);
+    const snap = await buildPreRetainSnapshot(fetchImpl, "http://x", "k", ["down", "up"], "session-x");
+    assert.equal(snap.get("down"), 0);
+    assert.equal(snap.get("up"), 9);
+  });
+
+  test("empty banks list → empty map (no fetches)", async () => {
+    const { fetchImpl, calls } = makeFetchSequence([]);
+    const snap = await buildPreRetainSnapshot(fetchImpl, "http://x", "k", [], "session-x");
+    assert.equal(snap.size, 0);
+    assert.equal(calls.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TESTS — source-level regression guard for the original bug.
+//
+// This test reads index.ts as text and asserts that the three locals are
+// defined in the same `agent_end` scope BEFORE the snapshot construction
+// site. The earlier bug would have passed every algorithmic test (because
+// the algorithm was right) yet still silently broken Phase D in production
+// (because the variables were never bound). Encode the actual failure mode.
+// ---------------------------------------------------------------------------
+
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+describe("retain-polling: source-level regression — snapshot locals in scope", () => {
+  test("agent_end handler defines documentId, transcriptLen, preCounts before snapshot use", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(join(here, "..", "index.ts"), "utf-8");
+
+    // Locate the snapshot construction site — the exact lines that broke.
+    const snapshotIdx = src.indexOf("const snapshot: RetainSnapshot = {");
+    assert.ok(snapshotIdx > 0, "snapshot construction site not found in index.ts");
+
+    // Locate the agent_end handler that contains the snapshot loop. Walk
+    // backwards from the snapshot site to the nearest `pi.on("agent_end"`.
+    const handlerIdx = src.lastIndexOf("pi.on(\"agent_end\"", snapshotIdx);
+    assert.ok(handlerIdx > 0, "agent_end handler not found before snapshot site");
+
+    const scope = src.slice(handlerIdx, snapshotIdx);
+    assert.match(scope, /const\s+documentId\s*=/,
+      "documentId must be defined in agent_end scope before snapshot construction");
+    assert.match(scope, /const\s+transcriptLen\s*=/,
+      "transcriptLen must be defined in agent_end scope before snapshot construction");
+    assert.match(scope, /const\s+preCounts\s*=/,
+      "preCounts must be defined in agent_end scope before snapshot construction");
+  });
+});

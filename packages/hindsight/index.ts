@@ -492,11 +492,46 @@ async function watchRetainOperation(
   }
 }
 
+/**
+ * Build the per-bank pre-retain snapshot of `memory_unit_count` for a given
+ * document. Runs all GETs in parallel; banks that 404 or fail map to 0
+ * (which is exactly the legitimate pre-count for a brand-new document).
+ *
+ * Extracted as a helper so the agent_end handler stays linear and so the
+ * snapshot logic is unit-testable without driving the full extension lifecycle.
+ */
+async function buildPreRetainSnapshot(
+  apiUrl: string,
+  apiKey: string,
+  banks: string[],
+  documentId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const results = await Promise.allSettled(
+    banks.map(async (b) => {
+      const n = await fetchDocumentUnitsCount(apiUrl, apiKey, b, documentId, fetchImpl);
+      return { bank: b, count: n ?? 0 };
+    }),
+  );
+  for (const r of results) {
+    if (r.status === "fulfilled") out.set(r.value.bank, r.value.count);
+  }
+  // Ensure every requested bank has an entry even if Promise.allSettled
+  // gave us a rejection (defensive — Promise.allSettled rejection should
+  // not happen since our mapper already swallows errors via fetchDocumentUnitsCount).
+  for (const b of banks) {
+    if (!out.has(b)) out.set(b, 0);
+  }
+  return out;
+}
+
 // Export internals for unit testing without recreating them in test files.
 export const __internal = {
   fetchDocumentUnitsCount,
   extractDocumentIds,
   watchRetainOperation,
+  buildPreRetainSnapshot,
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -1315,6 +1350,16 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     log(`retain: banks=${banks.join(",")} len=${transcript.length} tags=${tags.join(",")}`);
 
     try {
+      // ─── Phase D: pre-retain snapshot ─────────────────────────────────
+      // Snapshot per-bank memory_unit_count for this document BEFORE the
+      // POST so the watcher can compute a real delta after the operation
+      // completes. Without this, the watcher fires with preUnitsCount=0
+      // for every bank and zero-units detection silently misclassifies
+      // append-mode retains (which already had units) as failures.
+      const documentId = `session-${sessionId}`;
+      const transcriptLen = transcript.length;
+      const preCounts = await buildPreRetainSnapshot(config.api_url, config.api_key, banks, documentId);
+
       const t0 = Date.now();
       const results = await Promise.allSettled(
         banks.map(async (b) => {
@@ -1324,7 +1369,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             body: JSON.stringify({
               items: [{
                 content: transcript,
-                document_id: `session-${sessionId}`,
+                document_id: documentId,
                 update_mode: "append",
                 context: `pi | ${localDate} ${localTime} ${tz}`,
                 timestamp: new Date().toISOString(),
