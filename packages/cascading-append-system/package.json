@@ -1,0 +1,26 @@
+{
+  "name": "@ironin/pi-cascading-append-system",
+  "version": "1.0.0",
+  "description": "Cascade APPEND_SYSTEM.md across parent directories. Patches pi's resource-loader so every ancestor .pi/APPEND_SYSTEM.md (root → cwd) plus the global agentDir copy is appended, instead of only the cwd or agentDir match.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src/"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "cascade",
+    "system-prompt"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

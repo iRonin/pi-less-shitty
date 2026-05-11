@@ -19,6 +19,7 @@ Vibed by my clanker. Use at your own risk. I test as I go.
 |---------|-------------|
 | `@ironin/pi-autocomplete-base-paths` | Multi-directory `@` file autocomplete with per-project config (runtime patch) |
 | `@ironin/pi-cascading-skills` | Walks parent dirs to collect skills from every `.pi/` level |
+| `@ironin/pi-cascading-append-system` | Cascades `APPEND_SYSTEM.md` across parent `.pi/` dirs (runtime patch on `resource-loader.js`) |
 | `@ironin/pi-clear-on-double-esc` | Clear editor on double Escape |
 | `@ironin/pi-content-filter` | Sanitizes profanity from prompts, memories, and tool results via wildcard patterns |
 | `@ironin/pi-ctrl-a-multiline` | Rapid Ctrl+A presses navigate to previous lines |
