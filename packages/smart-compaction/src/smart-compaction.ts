@@ -1077,7 +1077,7 @@ export default function (pi: ExtensionAPI) {
   // Intercepts ALL compaction: auto-trigger + /compact
   const summaryModelDisplay = settings.compactionModel || "(session model)";
   pi.on("session_before_compact", async (event, ctx) => {
-    ctx.ui.setStatus("smart-compaction", `🗜️ ${summaryModelDisplay} score=${settings.scoringModel} k≥${settings.keepThreshold}`);
+    ctx.ui.setStatus("smart-compaction", `🗜️ ${summaryModelDisplay}`);
     const result = await handleSmartCompaction(event, ctx, settings);
     lastNotification = (result as any)?._notification ?? null;
     ctx.ui.setStatus("smart-compaction", undefined);
@@ -1093,7 +1093,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("smart-compaction", `🗜️ ${summaryModelDisplay} score=${settings.scoringModel} k≥${settings.keepThreshold}`);
+    ctx.ui.setStatus("smart-compaction", `🗜️ ${summaryModelDisplay}`);
 
     // Handle --smart-compress flag — print analysis, then ask pi to shut down
     // gracefully (flushes UI, drains event loop) instead of using process.exit
