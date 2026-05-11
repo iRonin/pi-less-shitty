@@ -1,20 +1,29 @@
 /**
- * prompt-dump — dist patch for `pi --prompt-dump`
+ * prompt-dump — dist patch for `pi --prompt-dump[-dry|-json|-section <name>]`
  *
  * Patches:
- *   1. cli/args.js   — recognise `--prompt-dump`
- *   2. main.js       — dump assembled prompt with chalk colours, section breakdown, file list
+ *   1. cli/args.js   — recognise --prompt-dump and the dry/json/section variants
+ *   2. main.js       — copies runtime.js next to main.js and inserts a tiny snippet
+ *                      that dynamic-imports the runtime to render the dump
  *
- * Replaces the lost --prompt-dump CLI flag.
- * Original was in local pi-mono clone (TRASHED). Rebuilt from session logs.
+ * The runtime (src/runtime.js) is pure JS ESM, importable for tests. The patch
+ * surface in main.js is intentionally tiny — all logic lives in runtime.js so
+ * upgrades only need to refresh the small wrapper snippet.
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { findPiCodingAgentDistFromCaller } from "../../pi-resolve/src/index.ts";
 
+const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
+const RUNTIME_SRC = path.join(SELF_DIR, "runtime.js");
+const RUNTIME_BASENAME = "_prompt-dump-runtime.js";
+
+const HANDLER_MARKER = "prompt-dump handler";
+
 function findPiDistDir(override?: string): string | null {
-	const res = findPiCodingAgentDistFromCaller(import.meta.url, "cli/args.js", override);
+	const res = findPiCodingAgentDistFromCaller(import.meta.url, { probe: "cli/args.js", override });
 	return res?.distDir ?? null;
 }
 
@@ -23,132 +32,122 @@ function patchArgsJs(distDir: string): boolean {
 	if (!fs.existsSync(filePath)) return false;
 	let c = fs.readFileSync(filePath, "utf8");
 
-	if (c.includes("--prompt-dump")) return true; // already patched
+	const wanted = [
+		"--prompt-dump",
+		"--prompt-dump-dry",
+		"--prompt-dump-json",
+		"--prompt-dump-section",
+	];
+	if (wanted.every((flag) => c.includes(flag))) return true; // already patched (current shape)
 
+	// Strip any older partial patch so we re-insert a clean canonical block.
 	c = c.replace(
-		'else if (arg === "--offline") {\n            result.offline = true;\n        }\n        else if (arg.startsWith("@"))',
-		'else if (arg === "--offline") {\n            result.offline = true;\n        }\n        else if (arg === "--prompt-dump") {\n            result.promptDump = true;\n        }\n        else if (arg.startsWith("@"))'
+		/\s*else if \(arg === "--prompt-dump(-dry|-json|-section)?"\) \{[\s\S]*?\}\s*\n/g,
+		"\n",
+	);
+	c = c.replace(
+		/\s*else if \(arg === "--prompt-dump"\) \{\s*result\.promptDump = true;\s*\}\s*\n/g,
+		"\n",
 	);
 
-	fs.writeFileSync(filePath, c, "utf8");
-	return true;
-}
+	const anchor =
+		'else if (arg === "--offline") {\n            result.offline = true;\n        }\n        else if (arg.startsWith("@"))';
+	const block =
+		'else if (arg === "--offline") {\n            result.offline = true;\n        }\n' +
+		'        else if (arg === "--prompt-dump") {\n            result.promptDump = true;\n        }\n' +
+		'        else if (arg === "--prompt-dump-dry") {\n            result.promptDumpDry = true;\n        }\n' +
+		'        else if (arg === "--prompt-dump-json") {\n            result.promptDumpJson = true;\n        }\n' +
+		'        else if (arg === "--prompt-dump-section" && i + 1 < args.length) {\n            result.promptDumpSection = args[++i];\n        }\n' +
+		'        else if (arg.startsWith("@"))';
 
-function patchMainJs(distDir: string): boolean {
-	const filePath = path.join(distDir, "main.js");
-	if (!fs.existsSync(filePath)) return false;
-	let c = fs.readFileSync(filePath, "utf8");
-
-	if (c.includes("--- prompt-dump handler ---")) return true;
-
-	const promptDumpHandler = `    if (parsed.promptDump) {
-        // Trigger extension resource discovery (normally done by modes via bindExtensions)
-        await session.bindExtensions({});
-
-        const sysPrompt = session.systemPrompt || "";
-        const totalTokens = Math.ceil(sysPrompt.length / 4);
-
-        // Section breakdown — detect structural boundaries of the system prompt
-        const sectionMarkers = [
-            { name: "Available tools", regex: /^Available tools:/m },
-            { name: "Guidelines", regex: /^Guidelines:/m },
-            { name: "Pi documentation", regex: /^Pi documentation/m },
-            { name: "# Project Context", regex: /^# Project Context/m },
-            { name: "Skills (<available_skills>)", regex: /<available_skills>/m },
-            { name: "Footer (date/cwd)", regex: /^Current date:/m },
-        ];
-        const boundaries = [{ name: "Preamble", index: 0 }];
-        for (const sp of sectionMarkers) {
-            sp.regex.lastIndex = 0;
-            const m = sp.regex.exec(sysPrompt);
-            if (m) boundaries.push({ name: sp.name, index: m.index });
-        }
-        boundaries.sort((a, b) => a.index - b.index);
-
-        const stats = [];
-        for (let i = 0; i < boundaries.length; i++) {
-            const start = boundaries[i].index;
-            const end = i + 1 < boundaries.length ? boundaries[i + 1].index : sysPrompt.length;
-            const t = Math.ceil(sysPrompt.slice(start, end).length / 4);
-            stats.push({ name: boundaries[i].name, tokens: t, pct: ((t / totalTokens) * 100).toFixed(1) });
-        }
-
-        console.error("\\n" + chalk.bold("System Prompt Token Analysis"));
-        console.error("─".repeat(60));
-        console.error(chalk.bold("Total (chars/4 est.)".padEnd(35)) + chalk.bold(String(totalTokens).padStart(10)) + " tokens");
-        console.error("");
-        console.error(chalk.bold("Section Breakdown"));
-        console.error("─".repeat(60));
-        for (const s of stats) {
-            const bar = "█".repeat(Math.round(parseFloat(s.pct) / 2));
-            console.error(\`  \${chalk.green(s.name.padEnd(35))}\${String(s.tokens).padStart(8)} tokens  \${s.pct}% \${chalk.dim(bar)}\`);
-        }
-        console.error("");
-
-        // Context files
-        const agentsFiles = resourceLoader.getAgentsFiles().agentsFiles || [];
-        if (agentsFiles.length > 0) {
-            console.error(chalk.bold("Context Files"));
-            console.error("─".repeat(60));
-            for (const f of agentsFiles) {
-                const ft = Math.ceil((f.content || "").length / 4);
-                console.error(\`  \${chalk.cyan(f.path)}  \${ft} tokens\`);
-            }
-            console.error("");
-        }
-
-        // Skills
-        const skills = resourceLoader.getSkills() || [];
-        const skillList = Array.isArray(skills) ? skills : (skills.skills || []);
-        if (skillList.length > 0) {
-            console.error(chalk.bold("Skills"));
-            console.error("─".repeat(60));
-            for (const sk of skillList) {
-                const skPath = sk.path || sk.file || "";
-                const skName = sk.name || path.basename(skPath, ".md");
-                console.error(\`  \${chalk.yellow(skName)}\`);
-            }
-            console.error("");
-        }
-
-        // Full prompt
-        console.error(chalk.bold("Full System Prompt"));
-        console.error("─".repeat(60));
-        console.error(sysPrompt);
-        console.error("");
-        console.error("─".repeat(60));
-        console.error(chalk.bold("Total") + ": ~" + totalTokens.toLocaleString() + " tokens");
-        console.error(chalk.bold("Chars") + ": " + sysPrompt.length.toLocaleString());
-
-        process.exit(0);
-    }`;
-
-	const listBlock = `    if (parsed.listModels !== undefined) {
-        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
-        await listModels(modelRegistry, searchPattern);
-        process.exit(0);
-    }
-    // Read piped stdin content`;
-
-	const newBlock = `    if (parsed.listModels !== undefined) {
-        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
-        await listModels(modelRegistry, searchPattern);
-        process.exit(0);
-    }
-
-    // --- prompt-dump handler ---
-${promptDumpHandler}
-    // --- end prompt-dump handler ---
-    // Read piped stdin content`;
-
-	if (!c.includes(listBlock)) return false;
-	const next = c.replace(listBlock, newBlock);
+	if (!c.includes(anchor)) return false;
+	const next = c.replace(anchor, block);
 	if (next === c) return false;
 	fs.writeFileSync(filePath, next, "utf8");
 	return true;
 }
 
-// ── Extension entry ─────────────────────────────────────────────────
+function copyRuntime(distDir: string): string | null {
+	if (!fs.existsSync(RUNTIME_SRC)) {
+		console.error("[prompt-dump] runtime.js missing at " + RUNTIME_SRC);
+		return null;
+	}
+	const dest = path.join(distDir, RUNTIME_BASENAME);
+	try {
+		const src = fs.readFileSync(RUNTIME_SRC, "utf8");
+		if (fs.existsSync(dest) && fs.readFileSync(dest, "utf8") === src) return dest;
+		fs.writeFileSync(dest, src, "utf8");
+		return dest;
+	} catch (err) {
+		console.error("[prompt-dump] failed to copy runtime: " + (err as Error).message);
+		return null;
+	}
+}
+
+function patchMainJs(distDir: string): boolean {
+	const filePath = path.join(distDir, "main.js");
+	if (!fs.existsSync(filePath)) return false;
+	const original = fs.readFileSync(filePath, "utf8");
+
+	const runtimeDest = copyRuntime(distDir);
+	if (!runtimeDest) return false;
+
+	// Tiny wrapper — dispatches all four flags to the runtime. `chalk` is
+	// imported at the top of main.js so we forward it to keep the runtime
+	// importable in test environments without chalk in node_modules.
+	const wrapper =
+		'    // --- ' + HANDLER_MARKER + ' ---\n' +
+		'    if (parsed.promptDump || parsed.promptDumpDry || parsed.promptDumpJson || parsed.promptDumpSection !== undefined) {\n' +
+		'        await session.bindExtensions({});\n' +
+		'        const { runPromptDump } = await import("./' + RUNTIME_BASENAME + '");\n' +
+		'        await runPromptDump({ cwd, agentDir, session, resourceLoader, parsed, chalk });\n' +
+		'        process.exit(0);\n' +
+		'    }\n' +
+		'    // --- end ' + HANDLER_MARKER + ' ---\n';
+
+	const listBlock =
+		'    if (parsed.listModels !== undefined) {\n' +
+		'        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;\n' +
+		'        await listModels(modelRegistry, searchPattern);\n' +
+		'        process.exit(0);\n' +
+		'    }\n' +
+		'    // Read piped stdin content';
+
+	// Remove any previous handler block (legacy or current) so we rewrite cleanly
+	// against an untouched anchor. The legacy handler sits between listBlock's
+	// closing brace and "// Read piped stdin content" so we must strip it first
+	// before the anchor reappears in the source. The regex tolerates any
+	// surrounding dash/space decoration (older patcher versions accidentally
+	// doubled the dashes).
+	let cleaned = original.replace(
+		/\s*\/\/[- ]*prompt-dump handler[- ]*\n[\s\S]*?\/\/[- ]*end[- ]+prompt-dump handler[- ]*\n/g,
+		"\n",
+	);
+
+	if (!cleaned.includes(listBlock)) {
+		// Anchor missing even after stripping any legacy handler — guard against
+		// false-positive write.
+		return false;
+	}
+
+	const replacement =
+		'    if (parsed.listModels !== undefined) {\n' +
+		'        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;\n' +
+		'        await listModels(modelRegistry, searchPattern);\n' +
+		'        process.exit(0);\n' +
+		'    }\n\n' +
+		wrapper +
+		'    // Read piped stdin content';
+
+	if (!cleaned.includes(listBlock)) return false;
+	const next = cleaned.replace(listBlock, replacement);
+	if (next === cleaned) return false;
+	if (next === original) return true; // nothing to do
+	fs.writeFileSync(filePath, next, "utf8");
+	return true;
+}
+
+// ── Extension entry ─────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	const distDir = findPiDistDir();

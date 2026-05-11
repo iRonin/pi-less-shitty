@@ -4,110 +4,138 @@ import os from "node:os";
 import path from "node:path";
 
 /**
- * FIX B verification: patchMainJs must not write the file or report success
- * when the anchor `listBlock` is missing from main.js. The original bug was
- * that `c.replace(listBlock, ...)` returned the unchanged string, then the
- * function wrote it back unchanged and returned `true` (false-positive).
- *
- * This test exercises the real code by pointing it at a temp dist tree
- * containing a stub main.js without the anchor.
+ * Guards against false-positive writes when main.js lacks the listModels anchor,
+ * and validates that the patch installs all four CLI flags + copies the runtime.
  */
 
-describe("prompt-dump patchMainJs guard (FIX B)", () => {
-  let tmpDir: string;
-  let distDir: string;
-  let mainPath: string;
+describe("prompt-dump patchMainJs", () => {
+	let tmpDir: string;
+	let distDir: string;
+	let mainPath: string;
+	let argsPath: string;
 
-  beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-dump-test-"));
-    distDir = path.join(tmpDir, "dist");
-    fs.mkdirSync(path.join(distDir, "cli"), { recursive: true });
-    mainPath = path.join(distDir, "main.js");
-  });
+	beforeEach(() => {
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-dump-test-"));
+		distDir = path.join(tmpDir, "dist");
+		fs.mkdirSync(path.join(distDir, "cli"), { recursive: true });
+		mainPath = path.join(distDir, "main.js");
+		argsPath = path.join(distDir, "cli", "args.js");
+	});
 
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
+	afterEach(() => {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	});
 
-  async function loadPatchMainJs() {
-    // Re-import fresh each time so module-scope state doesn't leak.
-    vi.resetModules();
-    const mod = await import("../src/index.ts");
-    return mod;
-  }
+	async function loadModule() {
+		vi.resetModules();
+		return await import("../src/index.ts");
+	}
 
-  it("returns without writing when listBlock anchor is missing", async () => {
-    // main.js without the listModels block — no anchor present.
-    const original = `// stub main.js — no listModels block here\nconsole.log("hello");\n`;
-    fs.writeFileSync(mainPath, original, "utf8");
+	function stubArgsJs() {
+		// Minimal args.js stub containing the anchor line our patcher targets.
+		fs.writeFileSync(
+			argsPath,
+			'export function parseArgs(args) {\n' +
+			'  const result = {};\n' +
+			'  for (let i = 0; i < args.length; i++) {\n' +
+			'    const arg = args[i];\n' +
+			'    if (false) {}\n' +
+			'        else if (arg === "--offline") {\n' +
+			'            result.offline = true;\n' +
+			'        }\n' +
+			'        else if (arg.startsWith("@")) {}\n' +
+			'  }\n' +
+			'  return result;\n' +
+			'}\n',
+			"utf8",
+		);
+	}
 
-    // Stub args.js so patchArgsJs short-circuits via the "already patched" branch.
-    fs.writeFileSync(
-      path.join(distDir, "cli", "args.js"),
-      'const x = "--prompt-dump";\n',
-      "utf8",
-    );
+	function stubMainJsWithAnchor() {
+		const original =
+			'console.log("pre");\n' +
+			'    if (parsed.listModels !== undefined) {\n' +
+			'        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;\n' +
+			'        await listModels(modelRegistry, searchPattern);\n' +
+			'        process.exit(0);\n' +
+			'    }\n' +
+			'    // Read piped stdin content\n' +
+			'console.log("post");\n';
+		fs.writeFileSync(mainPath, original, "utf8");
+		return original;
+	}
 
-    // Build a fake pi extension API and invoke the entry point so the
-    // load-time patch attempt runs against our temp dist.
-    const mod = await loadPatchMainJs();
+	it("returns without writing when listBlock anchor is missing", async () => {
+		const original = '// stub main.js — no listModels block here\nconsole.log("hello");\n';
+		fs.writeFileSync(mainPath, original, "utf8");
+		stubArgsJs();
 
-    // The default export is the extension entry. We can't easily redirect
-    // DIST_DIR after the fix without env or arg, so we monkey-patch the
-    // module's findPiDistDir result by overriding via a temp symlink farm:
-    // simpler — just call the entry and inspect that the temp main.js
-    // wasn't modified after pointing PATH/HOME via the walk-up fallback.
-    //
-    // Easiest deterministic check: invoke the extension with a stub pi that
-    // captures session_start, then trigger session_start with ctx.piInstallDir
-    // pointing at our temp dist.
-    let sessionHandler: any;
-    const fakePi: any = {
-      on: (evt: string, cb: any) => {
-        if (evt === "session_start") sessionHandler = cb;
-      },
-    };
-    mod.default(fakePi);
-    expect(sessionHandler).toBeTypeOf("function");
+		const mod = await loadModule();
+		let sessionHandler: any;
+		const fakePi: any = { on: (evt: string, cb: any) => { if (evt === "session_start") sessionHandler = cb; } };
+		mod.default(fakePi);
 
-    const before = fs.readFileSync(mainPath, "utf8");
-    await sessionHandler({}, { piInstallDir: distDir });
-    const after = fs.readFileSync(mainPath, "utf8");
+		const before = fs.readFileSync(mainPath, "utf8");
+		await sessionHandler({}, { piInstallDir: distDir });
+		const after = fs.readFileSync(mainPath, "utf8");
 
-    // File must not be modified — guard short-circuited.
-    expect(after).toBe(before);
-    expect(after).toBe(original);
-  });
+		expect(after).toBe(before);
+		expect(after).toBe(original);
+	});
 
-  it("writes the file when the anchor IS present (positive control)", async () => {
-    const original =
-      'console.log("pre");\n' +
-      '    if (parsed.listModels !== undefined) {\n' +
-      '        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;\n' +
-      "        await listModels(modelRegistry, searchPattern);\n" +
-      "        process.exit(0);\n" +
-      "    }\n" +
-      "    // Read piped stdin content\n" +
-      'console.log("post");\n';
-    fs.writeFileSync(mainPath, original, "utf8");
-    fs.writeFileSync(
-      path.join(distDir, "cli", "args.js"),
-      'const x = "--prompt-dump";\n',
-      "utf8",
-    );
+	it("patches main.js + args.js + copies runtime when anchor present", async () => {
+		stubMainJsWithAnchor();
+		stubArgsJs();
 
-    const mod = await loadPatchMainJs();
-    let sessionHandler: any;
-    const fakePi: any = {
-      on: (evt: string, cb: any) => {
-        if (evt === "session_start") sessionHandler = cb;
-      },
-    };
-    mod.default(fakePi);
-    await sessionHandler({}, { piInstallDir: distDir });
+		const mod = await loadModule();
+		let sessionHandler: any;
+		const fakePi: any = { on: (evt: string, cb: any) => { if (evt === "session_start") sessionHandler = cb; } };
+		mod.default(fakePi);
+		await sessionHandler({}, { piInstallDir: distDir });
 
-    const after = fs.readFileSync(mainPath, "utf8");
-    expect(after).toContain("--- prompt-dump handler ---");
-    expect(after.length).toBeGreaterThan(original.length);
-  });
+		// main.js patched with wrapper + dynamic import
+		const mainAfter = fs.readFileSync(mainPath, "utf8");
+		expect(mainAfter).toContain("// --- prompt-dump handler ---");
+		expect(mainAfter).toContain("// --- end prompt-dump handler ---");
+		expect(mainAfter).toContain('await import("./_prompt-dump-runtime.js")');
+		expect(mainAfter).toContain("parsed.promptDump");
+		expect(mainAfter).toContain("parsed.promptDumpDry");
+		expect(mainAfter).toContain("parsed.promptDumpJson");
+		expect(mainAfter).toContain("parsed.promptDumpSection");
+
+		// args.js patched with all four flags
+		const argsAfter = fs.readFileSync(argsPath, "utf8");
+		expect(argsAfter).toContain('arg === "--prompt-dump"');
+		expect(argsAfter).toContain('arg === "--prompt-dump-dry"');
+		expect(argsAfter).toContain('arg === "--prompt-dump-json"');
+		expect(argsAfter).toContain('arg === "--prompt-dump-section"');
+		expect(argsAfter).toContain("result.promptDumpSection = args[++i]");
+
+		// runtime copied next to main.js
+		const runtimeDest = path.join(distDir, "_prompt-dump-runtime.js");
+		expect(fs.existsSync(runtimeDest)).toBe(true);
+		expect(fs.readFileSync(runtimeDest, "utf8")).toContain("export async function runPromptDump");
+	});
+
+	it("is idempotent — re-running session_start does not duplicate the handler", async () => {
+		stubMainJsWithAnchor();
+		stubArgsJs();
+
+		const mod = await loadModule();
+		let sessionHandler: any;
+		const fakePi: any = { on: (evt: string, cb: any) => { if (evt === "session_start") sessionHandler = cb; } };
+		mod.default(fakePi);
+		await sessionHandler({}, { piInstallDir: distDir });
+		const first = fs.readFileSync(mainPath, "utf8");
+		await sessionHandler({}, { piInstallDir: distDir });
+		const second = fs.readFileSync(mainPath, "utf8");
+
+		expect(second).toBe(first);
+		// Exactly one handler block in the file
+		// Exactly one open + one close marker in the file (no duplicates).
+		const opens = (first.match(/\/\/ --- prompt-dump handler ---/g) || []).length;
+		const closes = (first.match(/\/\/ --- end prompt-dump handler ---/g) || []).length;
+		expect(opens).toBe(1);
+		expect(closes).toBe(1);
+	});
 });
