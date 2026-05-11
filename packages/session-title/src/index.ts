@@ -12,13 +12,27 @@ import { basename } from "node:path";
 
 export default function (pi: ExtensionAPI) {
 	function updateTitle(ctx: ExtensionContext): void {
-		const name = pi.getSessionName();
-		const dirName = basename(ctx.cwd);
+		// agent_end is queued asynchronously inside the agent session and can be
+		// processed after the runtime has invalidated the ctx on exit (notably
+		// `pi -p "..."` single-shot mode, where disposeRuntime() runs as soon as
+		// session.prompt() resolves — possibly before the agent_end handler is
+		// dequeued). Once invalidated, every pi/ctx API throws the
+		// "stale after session replacement or reload" error. Title updates are
+		// cosmetic — swallow that specific race and rethrow anything else.
+		try {
+			const name = pi.getSessionName();
+			const dirName = basename(ctx.cwd);
 
-		if (name) {
-			ctx.ui.setTitle(`${name} — ${dirName}`);
-		} else {
-			ctx.ui.setTitle(dirName);
+			if (name) {
+				ctx.ui.setTitle(`${name} — ${dirName}`);
+			} else {
+				ctx.ui.setTitle(dirName);
+			}
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (!msg.includes("stale after session replacement or reload")) {
+				throw err;
+			}
 		}
 	}
 
