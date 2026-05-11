@@ -285,9 +285,9 @@ describe("health state transitions", () => {
   });
 
   test("markUnhealthy captures reason and timestamp", () => {
-    markUnhealthy("zero-facts retain");
+    markUnhealthy("zero units extracted");
     assert.equal(healthState.healthy, false);
-    assert.equal(healthState.reason, "zero-facts retain");
+    assert.equal(healthState.reason, "zero units extracted");
     assert.ok(healthState.markedAt, "markedAt should be set");
     assert.match(healthState.markedAt!, /^\d{4}-\d{2}-\d{2}T/);
   });
@@ -574,7 +574,7 @@ describe("healthGate end-to-end", () => {
   });
 
   test("unhealthy + warn → recall still fires, NOT blocked", async () => {
-    markUnhealthy("zero-facts retain");
+    markUnhealthy("zero units extracted");
     const fetchMock = mock.fn(async () => ({ ok: true, status: 200, json: async () => ({ results: [{ text: "memory" }] }) } as any));
     const r = await simulateBeforeAgentStart({
       config, settings: buildSettings({ healthGate: "warn" }, null),
@@ -587,7 +587,7 @@ describe("healthGate end-to-end", () => {
   });
 
   test("unhealthy + block → prompt blocked, abort called, fetch never invoked", async () => {
-    markUnhealthy("zero-facts retain");
+    markUnhealthy("zero units extracted");
     const fetchMock = mock.fn(async () => ({ ok: true, status: 200, json: async () => ({ results: [] }) } as any));
     const abort = { value: false };
     const r = await simulateBeforeAgentStart({
@@ -598,13 +598,13 @@ describe("healthGate end-to-end", () => {
     assert.equal(abort.value, true, "ctx.abort() should have been called");
     assert.equal(fetchMock.mock.calls.length, 0, "no recall network call when blocked");
     assert.equal(r.injectedMessage.customType, "hindsight-blocked");
-    assert.equal(r.injectedMessage.details.reason, "zero-facts retain");
+    assert.equal(r.injectedMessage.details.reason, "zero units extracted");
     assert.equal(r.newRecallDone, false, "blocked prompt does not consume the recall slot");
     assert.equal(r.newRecallAttempts, 0, "attempt counter not incremented on block");
   });
 
   test("unhealthy + off → never blocks, even with explicit block reason", async () => {
-    markUnhealthy("zero-facts retain");
+    markUnhealthy("zero units extracted");
     const fetchMock = mock.fn(async () => ({ ok: true, status: 200, json: async () => ({ results: [] }) } as any));
     const r = await simulateBeforeAgentStart({
       config, settings: buildSettings({ healthGate: "off" }, null),
@@ -615,7 +615,7 @@ describe("healthGate end-to-end", () => {
   });
 
   test("block: after /hindsight reset clears unhealthy, next turn proceeds", async () => {
-    markUnhealthy("zero-facts retain");
+    markUnhealthy("zero units extracted");
     const fetchMock = mock.fn(async () => ({ ok: true, status: 200, json: async () => ({ results: [{ text: "m" }] }) } as any));
     // First turn: blocked
     const r1 = await simulateBeforeAgentStart({

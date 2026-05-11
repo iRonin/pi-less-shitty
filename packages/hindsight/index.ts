@@ -208,33 +208,45 @@ function shouldSkipRetain(prompt: string | null): { skip: boolean; reason?: stri
   return { skip: false };
 }
 
-// ─── Operation Polling (Silent-Failure Detection — Phase B) ────────────
+// ─── Operation Polling (Silent-Failure Detection — Phase D) ────────────
 //
 // Hindsight's POST /memories with async:true returns HTTP 200 + an operation_id.
 // The server then runs LLM fact extraction in the background. If extraction
 // fails (LLM down, budget exhausted, model misconfig) the operation can either:
-//   - be marked `failed` with an error_message, or
-//   - be marked `completed` with zero facts extracted (silent failure — the
-//     4-day bug we are fixing).
+//   - be marked `failed` with an error_message (reliable), or
+//   - be marked `completed` with no units committed (silent failure).
 //
-// Detection rule (verified empirically against vectorize-io/hindsight:latest):
-//   `result_metadata.unit_ids_count` is only written by the streaming retain
-//   path when at least one fact is committed (orchestrator.py line ~1128:
-//   `if operation_id and all_unit_ids`). For a parent batch_retain operation,
-//   the parent's own result_metadata never carries this field — we aggregate
-//   across child_operations instead.
+// Phase B/C attempted to detect silent failure by reading
+// `result_metadata.unit_ids_count`. That field is only written by hindsight's
+// streaming checkpoint path (orchestrator.py ~529); MOST completed retains
+// bypass that path and ship a `result_metadata` without `unit_ids_count`.
+// Treating the missing field as zero-facts produced massive false positives.
 //
-//   completed + (∑ child unit_ids_count) === 0  →  zero-facts alert
-//   completed + no child has any unit_ids_count → zero-facts alert (matches
-//     the actual production bug pattern: 0-fact retains have the field absent)
-//   completed + ∑ unit_ids_count >= 1           →  silent happy path
-//   failed                                       →  failed alert with error_message
-//   timeout                                      →  debug log only
+// Phase D replaces the metadata sniff with a REAL post-retain check:
+//   1. Before POST /memories, fetch the target document's current
+//      `memory_unit_count` (0 if the document does not yet exist).
+//   2. After the operation reaches `completed`, re-fetch the document and
+//      compute the unit delta added by this retain.
+//   3. Fire `hindsight-retain-zero-units-extracted` ONLY when:
+//        (a) the transcript was "substantial" (≥ SUBSTANTIAL_TRANSCRIPT_CHARS), AND
+//        (b) the post-retain delta is exactly 0.
+//      This is the genuine bug pattern: the LLM was asked to extract from real
+//      content and produced nothing.
+//   4. Status `failed` with `error_message` continues to fire the existing
+//      `hindsight-retain-failed-async` path (always reliable).
 //
 // All polling runs in the background, never awaited by agent_end.
 
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_ATTEMPTS = 24; // 5s * 24 = 120s
+// Empirical threshold for "this transcript was substantive enough that the LLM
+// should have extracted at least one fact". Picked to undershoot rather than
+// over-alert: real-world session retains observed at 14316/19395/25000+ chars
+// produce 14/37/74 units respectively, so anything ≥ 500 chars that yields 0
+// units is a strong signal of extraction failure. Inputs below 500 chars
+// commonly include trivial acks, status checks, single-sentence questions —
+// genuine zero-extraction outcomes for those are silent.
+export const SUBSTANTIAL_TRANSCRIPT_CHARS = 500;
 
 interface OperationStatusResponse {
   operation_id: string;
@@ -271,34 +283,43 @@ async function fetchOperation(
 }
 
 /**
- * Aggregate `unit_ids_count` across an operation and (if present) its children.
- * Returns:
- *   - number  ≥ 0   when at least one operation in the tree exposed the field
- *   - null          when no operation in the tree exposed the field
- *                   (treated as zero-facts in production: matches the bug pattern)
+ * Fetch the current `memory_unit_count` for a document, or `null` if the
+ * document does not exist yet (404) or the request failed.
+ *
+ * Used to snapshot pre/post unit counts around a retain, so we can detect the
+ * genuine "substantial input → 0 facts extracted" failure mode without
+ * relying on hindsight's inconsistent `result_metadata.unit_ids_count` field.
  */
-async function aggregateUnitsCount(
+async function fetchDocumentUnitsCount(
   apiUrl: string,
   apiKey: string,
   bank: string,
-  op: OperationStatusResponse,
+  documentId: string,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<number | null> {
-  let total = 0;
-  let anyFieldSeen = false;
-
-  const direct = op.result_metadata?.unit_ids_count;
-  if (typeof direct === "number") { total += direct; anyFieldSeen = true; }
-
-  if (Array.isArray(op.child_operations) && op.child_operations.length > 0) {
-    // Children are returned WITHOUT result_metadata — fetch each one.
-    for (const child of op.child_operations) {
-      const childOp = await fetchOperation(apiUrl, apiKey, bank, child.operation_id);
-      const c = childOp?.result_metadata?.unit_ids_count;
-      if (typeof c === "number") { total += c; anyFieldSeen = true; }
-    }
+  try {
+    const res = await fetchImpl(
+      `${apiUrl}/v1/default/banks/${bank}/documents/${documentId}`,
+      { headers: authHeader(apiKey), signal: AbortSignal.timeout(5000) } as any,
+    );
+    if (res.status === 404) return null;
+    if (!res.ok) return null;
+    const data = (await res.json()) as { memory_unit_count?: number };
+    return typeof data.memory_unit_count === "number" ? data.memory_unit_count : null;
+  } catch {
+    return null;
   }
+}
 
-  return anyFieldSeen ? total : null;
+/**
+ * Extract document_ids from a completed retain operation's `result_metadata`.
+ * The value is consistently written by hindsight at completion (verified
+ * against vectorize-io/hindsight:latest), unlike `unit_ids_count`.
+ */
+function extractDocumentIds(op: OperationStatusResponse): string[] {
+  const ids = op.result_metadata?.document_ids;
+  if (Array.isArray(ids)) return ids.filter((x): x is string => typeof x === "string");
+  return [];
 }
 
 /**
@@ -323,8 +344,25 @@ async function pollOperationUntilTerminal(
 }
 
 /**
+ * Per-bank pre-retain snapshot. `documentId` is the session-level document we
+ * are appending to; `preUnitsCount` is `memory_unit_count` BEFORE the retain.
+ * `transcriptLen` is the length of the content we POSTed; it gates whether a
+ * zero-delta result is treated as a likely extraction failure.
+ */
+export interface RetainSnapshot {
+  documentId: string;
+  preUnitsCount: number; // 0 if document didn't exist yet
+  transcriptLen: number;
+}
+
+/**
  * Background task: poll a single retain operation and surface failures.
  * `t0` is `Date.now()` at the moment the retain POST returned HTTP 200.
+ *
+ * Surfaces two genuine error modes:
+ *   1. status=failed                          → hindsight-retain-failed-async
+ *   2. completed + substantial + delta == 0   → hindsight-retain-zero-units-extracted
+ * Everything else stays silent (logs only).
  */
 async function watchRetainOperation(
   pi: ExtensionAPI,
@@ -333,6 +371,7 @@ async function watchRetainOperation(
   bank: string,
   operationId: string,
   t0: number,
+  snapshot: RetainSnapshot,
 ): Promise<void> {
   try {
     const op = await pollOperationUntilTerminal(config.api_url, config.api_key, bank, operationId);
@@ -365,37 +404,72 @@ async function watchRetainOperation(
       return;
     }
 
-    // status === "completed" — check whether any facts were retained.
-    const units = await aggregateUnitsCount(config.api_url, config.api_key, bank, op);
-    if (units === null || units === 0) {
-      log(`retain-poll: zero-facts op=${operationId} bank=${bank} age_ms=${op_age_ms} units=${units}`);
-      try { ctx.ui.setStatus?.("hindsight", "⚠ 0 facts retained"); } catch {}
-      // Phase C: a zero-facts retain means the LLM extraction silently
-      // failed. Mark hindsight unhealthy so the next before_agent_start can
-      // enforce healthGate (warn = status only; block = abort the turn).
-      // healthGate=off skips marking entirely so behavior matches Phase B.
+    // status === "completed" — verify units were actually extracted by
+    // delta-comparing the document's memory_unit_count to the pre-snapshot.
+    // Prefer the document_id from the op's result_metadata, but fall back to
+    // the snapshot's documentId so we cover the case where hindsight omitted
+    // the field for one-shot retains.
+    const opDocIds = extractDocumentIds(op);
+    const docId = opDocIds.includes(snapshot.documentId)
+      ? snapshot.documentId
+      : (opDocIds[0] || snapshot.documentId);
+    const postUnits = await fetchDocumentUnitsCount(config.api_url, config.api_key, bank, docId);
+
+    if (postUnits === null) {
+      // Document GET failed (network, 404 on a doc the op said it touched).
+      // We can't compute delta — stay silent rather than risk false positives.
+      log(`retain-poll: no-post-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId}`);
+      return;
+    }
+
+    const delta = postUnits - snapshot.preUnitsCount;
+    const substantial = snapshot.transcriptLen >= SUBSTANTIAL_TRANSCRIPT_CHARS;
+
+    if (delta <= 0 && substantial) {
+      log(`retain-poll: zero-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen}`);
+      try { ctx.ui.setStatus?.("hindsight", "⚠ 0 units extracted"); } catch {}
       try {
         const settings = loadSettings();
-        if (settings.healthGate !== "off") markUnhealthy("zero-facts retain");
+        if (settings.healthGate !== "off") markUnhealthy("zero units extracted");
       } catch (e) { log(`retain-poll: loadSettings failed ${e}`); }
       pi.sendMessage(
         {
-          customType: "hindsight-retain-zero-facts",
+          customType: "hindsight-retain-zero-units-extracted",
           content: "",
           display: true,
-          details: { bank, operation_id: operationId, op_age_ms, units_count: units },
+          details: {
+            bank,
+            operation_id: operationId,
+            op_age_ms,
+            document_id: docId,
+            pre_units_count: snapshot.preUnitsCount,
+            post_units_count: postUnits,
+            transcript_len: snapshot.transcriptLen,
+          },
         },
         { deliverAs: "nextTurn" },
       );
       return;
     }
 
-    // Happy path — silent.
-    log(`retain-poll: ok op=${operationId} bank=${bank} age_ms=${op_age_ms} units=${units}`);
+    if (delta <= 0 && !substantial) {
+      // Legitimate zero-extraction — input was too trivial. Silent.
+      log(`retain-poll: legit-zero op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen}`);
+      return;
+    }
+
+    log(`retain-poll: ok op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} delta=${delta}`);
   } catch (e) {
     log(`retain-poll: watcher error op=${operationId} bank=${bank} ${e}`);
   }
 }
+
+// Export internals for unit testing without recreating them in test files.
+export const __internal = {
+  fetchDocumentUnitsCount,
+  extractDocumentIds,
+  watchRetainOperation,
+};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
@@ -428,7 +502,7 @@ const hookStats: Record<string, HookStats> = { sessionStart: {}, recall: {}, ret
 //   off   → never blocks, never warns. Status bar still reflects errors.
 //   warn  → status bar only (DEFAULT — current behavior).
 //   block → mark hindsight UNHEALTHY on:
-//             (a) zero-facts retain (Phase B silent failure)
+//             (a) zero-units extracted retain (substantial input → 0 facts)
 //             (b) all-auth-failed recall
 //             (c) recall exhausted retries without success
 //           …then on next before_agent_start, call ctx.abort() and inject
@@ -736,13 +810,15 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     return new Text(t, 0, 0);
   });
 
-  pi.registerMessageRenderer("hindsight-retain-zero-facts", (msg, _opt, theme) => {
+  pi.registerMessageRenderer("hindsight-retain-zero-units-extracted", (msg, _opt, theme) => {
     const d = (msg.details as any) ?? {};
     let t = theme.fg("warning", "⚠ Hindsight");
-    t += theme.fg("muted", " retain completed but 0 facts extracted");
+    t += theme.fg("muted", " retain completed but added 0 units");
     if (d.bank) t += theme.fg("dim", ` → ${d.bank}`);
     if (typeof d.op_age_ms === "number") t += theme.fg("dim", ` (${Math.round(d.op_age_ms / 1000)}s)`);
-    t += "\n" + theme.fg("dim", "  LLM extraction likely failed silently — check ~/Work/llm-mode.sh status");
+    if (typeof d.transcript_len === "number") t += theme.fg("dim", ` [${d.transcript_len} chars in]`);
+    t += "\n" + theme.fg("dim", "  Substantial input → 0 facts extracted suggests the extraction LLM is down.");
+    t += "\n" + theme.fg("dim", "  Check `docker logs hindsight --tail 50` and `~/Work/llm-mode.sh status`.");
     return new Text(t, 0, 0);
   });
 
@@ -937,8 +1013,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   //      optional LLM rerank) — the root cause of the ⚠ retrying status.
   //   3. The status bar only displays ⚠ retrying after the LAST retry has
   //      failed, never between retries inside one before_agent_start call.
-  //   4. healthGate=block: if unhealthy AT ENTRY (from prior zero-facts
-  //      retain or auth failure), abort the turn before recall.
+  //   4. healthGate=block: if unhealthy AT ENTRY (from prior zero-units
+  //      extracted or auth failure), abort the turn before recall.
   //   5. A successful recall flips healthState back to healthy — self-heals
   //      if the upstream LLM gateway recovers between turns.
   pi.on("before_agent_start", async (_event, ctx) => {
@@ -1037,7 +1113,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       if (anyOk) {
         recallDone = true;
         // Successful recall → self-heal. Clears unhealthy flag from a prior
-        // zero-facts retain or transient recall failure, so the user doesn't
+        // zero-units-extracted retain or transient recall failure, so the user doesn't
         // need to /hindsight reset once the upstream LLM gateway recovers.
         markHealthy();
         if (allResults.length) {
@@ -1151,14 +1227,20 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
       }
 
-      // ─── Phase B: background polling for silent failures ─────────────
-      // No await — these promises run after agent_end returns.
+      // ─── Phase D: background polling for silent failures ─────────────
+      // No await — these promises run after agent_end returns. Each watcher
+      // gets the per-bank pre-retain snapshot so it can compute a real delta.
       for (const { bank: b, operationId } of fulfilled) {
         if (!operationId) {
           log(`retain: bank=${b} no operation_id in response — skipping watcher`);
           continue;
         }
-        void watchRetainOperation(pi, ctx, config, b, operationId, t0);
+        const snapshot: RetainSnapshot = {
+          documentId,
+          preUnitsCount: preCounts.get(b) ?? 0,
+          transcriptLen,
+        };
+        void watchRetainOperation(pi, ctx, config, b, operationId, t0, snapshot);
       }
     } catch (e) {
       log(`retain: error ${e}`);
