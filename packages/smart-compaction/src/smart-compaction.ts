@@ -51,15 +51,33 @@ import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { scoreAllMessages, scoreAllMessagesSync, classify } from "./scorer.js";
 import { detectRetryLoops, type RetryLoop } from "./pattern-detector.js";
-// NOTE: buildModelChain / buildDeterministicSummary intentionally NOT used
-// here. Per user policy: only the configured compactionModel is tried;
-// failures propagate as hard errors. No silent fallback to other providers,
-// no deterministic non-LLM rescue. Those helpers remain in fallback-chain.ts
-// for archived test coverage but are dead code at this layer.
+import { resolveModelString } from "./fallback-chain.js";
+// NOTE: the older buildModelChain / buildDeterministicSummary multi-step
+// fallback chain is no longer used here. Policy is now binary:
+//   - compactionFallbackPolicy="off":  configured model only, fail loud.
+//   - compactionFallbackPolicy="auto": configured model, then a single
+//     fallback (compactionFallback) on network failures only. Auth errors
+//     and empty-content responses still fail loud regardless of policy.
+// resolveModelString is the only piece reused from fallback-chain.ts (model
+// spec string → registry model lookup).
+//
+// buildModelChain / buildDeterministicSummary remain in fallback-chain.ts
+// for test coverage but are dead code at this layer.
 
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
+
+// Fallback policy:
+//   "off"  — if the configured compactionModel errors or returns empty, FAIL
+//           loudly with a diagnostic. No silent substitution. Default.
+//   "auto" — on a network-class failure (timeout / ECONNREFUSED / DNS / 5xx),
+//           transparently retry with `compactionFallback` (e.g. local
+//           lmstudio). The user is ALWAYS notified via a banner AND the
+//           status bar updates to reflect the model that actually ran.
+//           Auth errors and empty-content responses still fail loud —
+//           those are config bugs the user must see.
+type CompactionFallbackPolicy = "off" | "auto";
 
 interface SmartCompactionSettings {
   keepThreshold: number;
@@ -70,12 +88,9 @@ interface SmartCompactionSettings {
   skipUnderMessages: number;
   scoringProvider: string;  // e.g. "openrouter", "google", "anthropic"
   scoringModel: string;      // e.g. "google/gemini-2.5-flash-lite"
-  compactionModel: string;   // e.g. "qwen/qwen3.6-plus" — model for LLM summary (required — if missing, session model is used)
-  // FALLBACK CHAIN INTENTIONALLY REMOVED.
-  // Per user policy: if the configured compactionModel returns empty or
-  // errors, the compaction MUST fail loudly so the user notices. Silently
-  // calling a different provider/model is dishonest — the user wants their
-  // configured model or nothing.
+  compactionModel: string;   // e.g. "qwen/qwen3.6-plus" — primary model for LLM summary (required — if missing, session model is used)
+  compactionFallbackPolicy: CompactionFallbackPolicy;
+  compactionFallback: string;  // e.g. "lmstudio/qwen/qwen3.6-35b-a3b" — single fallback model spec, only used when policy=auto
 }
 
 const DEFAULT_SETTINGS: SmartCompactionSettings = {
@@ -88,6 +103,8 @@ const DEFAULT_SETTINGS: SmartCompactionSettings = {
   scoringProvider: "openrouter",
   scoringModel: "google/gemini-2.5-flash-lite",
   compactionModel: "",
+  compactionFallbackPolicy: "off",
+  compactionFallback: "",
 };
 
 function readSettingsJson(): Partial<SmartCompactionSettings> {
@@ -106,12 +123,18 @@ function readSettingsJson(): Partial<SmartCompactionSettings> {
     if (typeof sc.scoringProvider === "string") out.scoringProvider = sc.scoringProvider as string;
     if (typeof sc.scoringModel === "string") out.scoringModel = sc.scoringModel as string;
     if (typeof sc.compactionModel === "string") out.compactionModel = sc.compactionModel as string;
+    if (typeof sc.compactionFallbackPolicy === "string"
+        && (sc.compactionFallbackPolicy === "off" || sc.compactionFallbackPolicy === "auto")) {
+      out.compactionFallbackPolicy = sc.compactionFallbackPolicy as CompactionFallbackPolicy;
+    }
+    if (typeof sc.compactionFallback === "string") out.compactionFallback = sc.compactionFallback as string;
     if (Array.isArray(sc.compactionFallbackModels)) {
-      // Honored for one release as a deprecation notice. Drop in next release.
+      // The old multi-model chain is gone. Emit one deprecation message so
+      // stale settings.json entries don't silently change behavior.
       console.error(
-        "[smart-compaction] WARN: settings.smartCompaction.compactionFallbackModels is no longer honored. "
-        + "Smart compaction now uses ONLY the configured compactionModel and fails loudly if it can't summarize. "
-        + "Remove this key from your settings.json to silence this warning.",
+        "[smart-compaction] WARN: settings.smartCompaction.compactionFallbackModels is obsolete. "
+        + "Use compactionFallbackPolicy=\"auto\" with a single compactionFallback (e.g. \"lmstudio/qwen/qwen3.6-35b-a3b\") instead. "
+        + "Remove the old key from settings.json to silence this warning.",
       );
     }
     return out;
@@ -259,26 +282,104 @@ Be dense with information. Every line should be something the next agent needs t
 ${conversationText}
 </conversation>${prevCtx}${focusCtx}${filesCtx}`;
 
-  // SINGLE configured model. No retry, no provider fallback, no deterministic
-  // rescue. The user explicitly chose this model in their settings.json (or
-  // implicitly via the session model fallback in resolveCompactionModel) and
-  // wants to know if it's not working — not have a different model silently
-  // substitute.
   const tag = `${model.provider}/${model.id}`;
   console.error(
     `[smart-compaction] prompt size: ${promptText.length} chars (~${Math.ceil(promptText.length / 4)} tokens), calling ${tag}`,
   );
 
-  const { text, diag } = await callOneModelWithDiag(model, modelRegistry, promptText, signal);
-  if (text) return text;
+  // === Primary attempt ====================================================
+  let primaryError: unknown = null;
+  try {
+    const { text, diag } = await callOneModelWithDiag(model, modelRegistry, promptText, signal);
+    if (text) return text;
 
-  // Empty response from the configured model — hard fail. Surface the
-  // diagnostic shape (stop reason, block types, usage) so the user can see
-  // WHY their model didn't produce content.
+    // Empty response from primary. Empty content is NEVER eligible for
+    // fallback — it means the model talked to us but produced no usable
+    // output (reasoning budget exhausted, content filter, etc). That's a
+    // configuration problem, not a connectivity problem.
+    throw new Error(
+      `Smart compaction: configured model ${tag} returned empty content (${diag}). `
+      + (settings.compactionFallbackPolicy === "auto"
+          ? `Fallback policy is "auto" but empty-content errors are not eligible for fallback (would mask a config bug).`
+          : `Fallback policy is "off". Set compactionFallbackPolicy="auto" + compactionFallback for network-outage resilience.`),
+    );
+  } catch (err) {
+    primaryError = err;
+    // Re-throw immediately when not eligible for fallback.
+    if (settings.compactionFallbackPolicy !== "auto") throw err;
+    if (signal.aborted) throw err;                    // user-cancel — don't retry
+    if (!isNetworkClassError(err)) throw err;         // auth / empty / config — fail loud as before
+  }
+
+  // === Fallback attempt (policy=auto, network-class error from primary) ===
+  const fallbackSpec = (settings.compactionFallback || "").trim();
+  if (!fallbackSpec) {
+    throw new Error(
+      `Smart compaction: primary model ${tag} failed (${(primaryError as any)?.message ?? primaryError}). `
+      + `Fallback policy is "auto" but compactionFallback is empty — set it in settings.json (e.g. "lmstudio/qwen/qwen3.6-35b-a3b").`,
+    );
+  }
+  const fbModel = resolveModelString(fallbackSpec, modelRegistry);
+  if (!fbModel) {
+    throw new Error(
+      `Smart compaction: primary model ${tag} failed (${(primaryError as any)?.message ?? primaryError}). `
+      + `Fallback model "${fallbackSpec}" could not be resolved against the model registry — check provider/model spelling.`,
+    );
+  }
+  if (fbModel.provider === model.provider && fbModel.id === model.id) {
+    throw new Error(
+      `Smart compaction: primary model ${tag} failed (${(primaryError as any)?.message ?? primaryError}). `
+      + `Fallback resolves to the same model — nothing to fall back to. Pick a different compactionFallback.`,
+    );
+  }
+
+  const fbTag = `${fbModel.provider}/${fbModel.id}`;
+  const reason = (primaryError as any)?.message?.toString() ?? String(primaryError);
+  const reasonShort = reason.length > 120 ? reason.slice(0, 120) + "…" : reason;
+
+  // LOUD visibility: banner + status bar update before the fallback call
+  // even starts. The user sees the fallback is happening in real time.
+  console.error(`[smart-compaction] primary ${tag} failed (${reasonShort}); falling back to ${fbTag}`);
+  try { ctx?.ui?.setStatus?.("smart-compaction", `🗜️ ${fbTag} ⚠ fallback`); } catch {}
+  try { ctx?.ui?.notify?.(`Smart compaction: primary ${tag} unreachable. Falling back to ${fbTag}.\nReason: ${reasonShort}`, "warning"); } catch {}
+
+  const { text: fbText, diag: fbDiag } = await callOneModelWithDiag(fbModel, modelRegistry, promptText, signal);
+  if (fbText) {
+    // Final "used fallback" confirmation banner — so the user knows their
+    // summary came from the fallback model, not the primary.
+    try { ctx?.ui?.notify?.(`Smart compaction: completed via fallback ${fbTag} (primary ${tag} was unreachable).`, "warning"); } catch {}
+    return fbText;
+  }
   throw new Error(
-    `Smart compaction: configured model ${tag} returned empty content (${diag}). `
-    + `No fallback chain is in use — fix the model config or check the provider.`,
+    `Smart compaction: primary ${tag} failed AND fallback ${fbTag} returned empty content (${fbDiag}). `
+    + `Both the network primary and the local fallback are unusable — investigate manually.`,
   );
+}
+
+// Classify thrown errors for fallback eligibility. Returns true for things
+// that look like "network outage" — connection refused, timeouts, 5xx, DNS
+// failures, fetch aborts. Returns false for auth errors, 4xx, our own
+// "empty content" throws, and unknown shapes (default to fail-loud).
+function isNetworkClassError(err: any): boolean {
+  if (!err) return false;
+  const code = err.code ?? err.cause?.code;
+  if (code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND"
+      || code === "ENETUNREACH" || code === "EAI_AGAIN" || code === "ECONNRESET"
+      || code === "UND_ERR_CONNECT_TIMEOUT" || code === "UND_ERR_SOCKET") {
+    return true;
+  }
+  const msg = String(err.message ?? err);
+  // Empty-content throw from our primary branch — NOT a network error.
+  if (/returned empty content/.test(msg)) return false;
+  // Our own auth-throw shape — NOT a network error.
+  if (/^auth failed\b/.test(msg)) return false;
+  // HTTP 5xx / 429 from the provider — treat as transient/server-side.
+  if (/\b(5\d{2}|429)\b/.test(msg)) return true;
+  // Generic fetch/network failure phrases from undici/node-fetch/openai-sdk.
+  if (/fetch failed|network (?:error|timeout)|connect (?:timeout|refused)|timed? out|socket hang up|unable to (?:reach|connect)/i.test(msg)) {
+    return true;
+  }
+  return false;
 }
 
 // Single model invocation with diagnostic shape return.
