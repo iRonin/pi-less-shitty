@@ -9,6 +9,11 @@
     ".": "./src/index.ts"
   },
   "files": ["src/"],
+  "scripts": {
+    "test": "vitest run && node --test --experimental-strip-types test/test-reasoning-loop.ts",
+    "test:tool": "vitest run",
+    "test:reasoning": "node --test --experimental-strip-types test/test-reasoning-loop.ts"
+  },
   "pi": {
     "extensions": ["./src/index.ts"]
   },

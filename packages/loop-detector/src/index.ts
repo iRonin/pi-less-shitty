@@ -6,21 +6,67 @@
  * - poll_no_progress: same tool, same error pattern, no progress (catches edit-loop failures)
  * - ping_pong: alternating between 2 actions without progress
  *
+ * ADDITIVE (Phase A + B, May 2026): also catches *reasoning-content* loops —
+ * the qwen-class failure mode where the model emits the same paragraph 20+
+ * times inside a `thinking` block without ever calling a tool.
+ *
+ *   - Phase A: with `LOOP_DEBUG_CAPTURE=true`, every assistant message is
+ *     appended to ~/.pi/agent/loop-debug/<session_id>.jsonl for offline replay.
+ *   - Phase B: a `ReasoningLoopDetector` runs against streaming `message_update`
+ *     deltas. On critical verdict, the in-progress generation is aborted via
+ *     `ctx.abort()` and a steering message is queued for the next turn.
+ *
  * Config via env vars:
  *   LOOP_DETECTION_ENABLED=true|false       (default: true)
  *   LOOP_DETECTION_WARNING_THRESHOLD=N       (default: 3)
  *   LOOP_DETECTION_CRITICAL_THRESHOLD=N      (default: 5)
  *   LOOP_DETECTION_WINDOW_SIZE=N             (default: 30)
  *   LOOP_DETECTION_MODE=warn|stop|prune      (default: stop)
+ *   LOOP_DEBUG_CAPTURE=true|false            (default: false)
  *
  * Or in ~/.pi/agent/settings.json:
- *   { "loopDetection": { "enabled": true, "mode": "stop", ... } }
+ *   { "loopDetection": {
+ *       "enabled": true, "mode": "stop", ...,
+ *       "debugCapture": false,
+ *       "reasoning": {
+ *         "enabled": true, "threshold": 3, "windowSize": 10,
+ *         "jaccardThreshold": 0.8, "mode": "stop",
+ *         "perModel": { "<model_id>": { "threshold": 2, "mode": "stop" } }
+ *       }
+ *     } }
  */
 
-import type { ExtensionAPI, ToolCallEvent, ToolResultEvent, AgentEndEvent, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ToolCallEvent,
+  ToolResultEvent,
+  AgentEndEvent,
+  ExtensionContext,
+  MessageUpdateEvent,
+  MessageEndEvent,
+} from "@earendil-works/pi-coding-agent";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { ToolLoopDetector, type LoopDetectorConfig, type LoopDetectorMode } from "./loop-detector.js";
+import {
+  ReasoningLoopDetector,
+  type ReasoningLoopConfig,
+  type ReasoningLoopMode,
+  DEFAULT_REASONING_CONFIG,
+} from "./reasoning-loop-detector.js";
+import { appendCapture, ensureCaptureDir, extractTurn, gcOldCaptures } from "./capture.js";
 
 // ── Config ───────────────────────────────────────────────────────────────────
+
+interface ReasoningSettings {
+  enabled: boolean;
+  threshold: number;
+  windowSize: number;
+  jaccardThreshold: number;
+  mode: ReasoningLoopMode;
+  perModel: Record<string, Partial<ReasoningLoopConfig> & { mode?: ReasoningLoopMode }>;
+}
 
 interface LoopDetectorSettings {
   enabled: boolean;
@@ -28,11 +74,54 @@ interface LoopDetectorSettings {
   criticalThreshold: number;
   windowSize: number;
   mode: LoopDetectorMode;
+  debugCapture: boolean;
+  reasoning: ReasoningSettings;
+}
+
+function readSettingsJson(): Record<string, unknown> {
+  try {
+    const path = join(homedir(), ".pi", "agent", "settings.json");
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    const ld = raw?.loopDetection;
+    return ld && typeof ld === "object" ? (ld as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 function loadSettings(): LoopDetectorSettings {
   const env = (key: string, fallback: string) =>
     process.env[`LOOP_DETECTION_${key}`] ?? fallback;
+
+  const file = readSettingsJson();
+  const fileReasoning =
+    file.reasoning && typeof file.reasoning === "object"
+      ? (file.reasoning as Record<string, unknown>)
+      : {};
+
+  const reasoning: ReasoningSettings = {
+    enabled: typeof fileReasoning.enabled === "boolean" ? fileReasoning.enabled : true,
+    threshold:
+      typeof fileReasoning.threshold === "number" && fileReasoning.threshold >= 2
+        ? (fileReasoning.threshold as number)
+        : DEFAULT_REASONING_CONFIG.threshold,
+    windowSize:
+      typeof fileReasoning.windowSize === "number" && fileReasoning.windowSize >= 2
+        ? (fileReasoning.windowSize as number)
+        : DEFAULT_REASONING_CONFIG.windowSize,
+    jaccardThreshold:
+      typeof fileReasoning.jaccardThreshold === "number"
+        ? (fileReasoning.jaccardThreshold as number)
+        : DEFAULT_REASONING_CONFIG.jaccardThreshold,
+    mode:
+      fileReasoning.mode === "warn" || fileReasoning.mode === "stop"
+        ? (fileReasoning.mode as ReasoningLoopMode)
+        : DEFAULT_REASONING_CONFIG.mode,
+    perModel:
+      fileReasoning.perModel && typeof fileReasoning.perModel === "object"
+        ? (fileReasoning.perModel as Record<string, Partial<ReasoningLoopConfig>>)
+        : {},
+  };
 
   return {
     enabled: envBool(env("ENABLED", "true")),
@@ -40,6 +129,10 @@ function loadSettings(): LoopDetectorSettings {
     criticalThreshold: envInt(env("CRITICAL_THRESHOLD", "10"), 10),
     windowSize: envInt(env("WINDOW_SIZE", "30"), 30),
     mode: envMode(env("MODE", "warn")),
+    debugCapture:
+      envBool(process.env.LOOP_DEBUG_CAPTURE ?? "") ||
+      (typeof file.debugCapture === "boolean" ? (file.debugCapture as boolean) : false),
+    reasoning,
   };
 }
 
@@ -62,6 +155,17 @@ function envMode(v: string): LoopDetectorMode {
 export default function loopDetectorExtension(pi: ExtensionAPI) {
   const settings = loadSettings();
   if (!settings.enabled) return;
+
+  // ── Phase A: capture setup (one-time on extension load) ─────────────────
+  if (settings.debugCapture) {
+    try {
+      ensureCaptureDir();
+      gcOldCaptures();
+      console.error("[loop-detector] LOOP_DEBUG_CAPTURE on — writing to ~/.pi/agent/loop-debug/");
+    } catch (e) {
+      console.error(`[loop-detector] capture setup failed: ${(e as Error).message}`);
+    }
+  }
 
   const validToolNames = new Set<string>();
 
@@ -221,4 +325,195 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
     engaged = false;
     currentLoopTool = null;
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Phase A — capture every assistant message_end (independent of Phase B)
+  // ──────────────────────────────────────────────────────────────────────
+
+  if (settings.debugCapture) {
+    pi.on("message_end", async (event: MessageEndEvent, ctx: ExtensionContext) => {
+      if (event?.message?.role !== "assistant") return;
+      try {
+        const turn = extractTurn(event.message);
+        if (turn) appendCapture(ctx.sessionManager.getSessionId(), turn);
+      } catch (e) {
+        console.error(`[loop-detector] capture write failed: ${(e as Error).message}`);
+      }
+    });
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Phase B — reasoning-content loop detector
+  // ──────────────────────────────────────────────────────────────────────
+
+  if (!settings.reasoning.enabled) return;
+
+  /** One detector instance, shared across turns. Reset between messages. */
+  const reasoning = new ReasoningLoopDetector({
+    threshold: settings.reasoning.threshold,
+    windowSize: settings.reasoning.windowSize,
+    jaccardThreshold: settings.reasoning.jaccardThreshold,
+    mode: settings.reasoning.mode,
+  });
+
+  /** Per-message bookkeeping. Reset on message_start. */
+  let reasoningCriticalFired = false;
+  let reasoningSeenLen = 0; // total chars consumed from `partial` so far
+  let currentMessageModel: string | null = null;
+
+  /** Apply per-model threshold override if configured. */
+  const applyPerModelOverride = (modelId: string | null): void => {
+    if (!modelId) {
+      reasoning.updateConfig({
+        threshold: settings.reasoning.threshold,
+        windowSize: settings.reasoning.windowSize,
+        jaccardThreshold: settings.reasoning.jaccardThreshold,
+        mode: settings.reasoning.mode,
+      });
+      return;
+    }
+    const override = settings.reasoning.perModel[modelId];
+    reasoning.updateConfig({
+      threshold:
+        override && typeof override.threshold === "number"
+          ? override.threshold
+          : settings.reasoning.threshold,
+      windowSize:
+        override && typeof override.windowSize === "number"
+          ? override.windowSize
+          : settings.reasoning.windowSize,
+      jaccardThreshold:
+        override && typeof override.jaccardThreshold === "number"
+          ? override.jaccardThreshold
+          : settings.reasoning.jaccardThreshold,
+      mode:
+        override && (override.mode === "warn" || override.mode === "stop")
+          ? override.mode
+          : settings.reasoning.mode,
+    });
+  };
+
+  /** Extract the running text + thinking content from a partial AssistantMessage. */
+  const extractRunningText = (partial: unknown): string => {
+    if (!partial || typeof partial !== "object") return "";
+    const content = (partial as Record<string, unknown>).content;
+    if (!Array.isArray(content)) return "";
+    let out = "";
+    for (const part of content) {
+      const p = part as Record<string, unknown>;
+      if ((p.type === "text" || p.type === "thinking") && typeof p.text === "string") {
+        out += (out ? "\n\n" : "") + (p.text as string);
+      }
+    }
+    return out;
+  };
+
+  pi.on("message_start", async (event: any, ctx: ExtensionContext) => {
+    if (event?.message?.role !== "assistant") return;
+    reasoning.reset();
+    reasoningCriticalFired = false;
+    reasoningSeenLen = 0;
+    // Pull model id from the active model registry (best-effort).
+    try {
+      const modelId =
+        (ctx.model as any)?.id ??
+        (event?.message?.model as string | undefined) ??
+        null;
+      currentMessageModel = typeof modelId === "string" ? modelId : null;
+      applyPerModelOverride(currentMessageModel);
+    } catch {
+      currentMessageModel = null;
+      applyPerModelOverride(null);
+    }
+  });
+
+  pi.on("message_update", async (event: MessageUpdateEvent, ctx: ExtensionContext) => {
+    if (reasoningCriticalFired) return;
+    if (event?.message?.role !== "assistant") return;
+
+    // Pull the full running text (text + thinking) from `partial` and only
+    // feed the *new* slice since last check. This is robust to differing
+    // provider stream event shapes — we don't rely on `delta` fields.
+    const ame = event.assistantMessageEvent as any;
+    const partial = ame?.partial ?? event.message;
+    const running = extractRunningText(partial);
+    if (running.length <= reasoningSeenLen) return;
+    const slice = running.slice(reasoningSeenLen);
+    reasoningSeenLen = running.length;
+
+    const verdict = reasoning.record(slice);
+    if (verdict.severity !== "critical") return;
+
+    reasoningCriticalFired = true;
+    handleReasoningCritical(verdict, ctx, "streaming");
+  });
+
+  pi.on("message_end", async (event: MessageEndEvent, ctx: ExtensionContext) => {
+    if (reasoningCriticalFired) return;
+    if (event?.message?.role !== "assistant") return;
+    const verdict = reasoning.flush();
+    if (verdict.severity !== "critical") return;
+    reasoningCriticalFired = true;
+    handleReasoningCritical(verdict, ctx, "final");
+  });
+
+  function handleReasoningCritical(
+    verdict: ReturnType<ReasoningLoopDetector["record"]>,
+    ctx: ExtensionContext,
+    when: "streaming" | "final",
+  ): void {
+    const repeatCount = verdict.repeatCount;
+    const sampleUnit = (verdict.sampleUnit ?? "").slice(0, 200);
+    const mode = reasoning.getConfig().mode;
+
+    const banner =
+      `🔁 Reasoning loop: same paragraph repeated ${repeatCount}× ` +
+      `inside this turn (${when}). Mode: ${mode}.`;
+
+    log("error", banner);
+
+    if (ctx.hasUI) {
+      try {
+        ctx.ui.setStatus("loop-detector", "🔁 reasoning loop");
+        ctx.ui.notify(banner, "error");
+      } catch {
+        /* non-fatal */
+      }
+    }
+
+    // Abort the in-progress generation when in stop mode + during streaming.
+    if (mode === "stop" && when === "streaming") {
+      try {
+        ctx.abort();
+      } catch (e) {
+        log("warn", `abort() failed: ${(e as Error).message}`);
+      }
+    }
+
+    // Steering message: visible in next turn.
+    const steerText =
+      `Detected a reasoning loop: ${sampleUnit}${sampleUnit.length === 200 ? "…" : ""}. ` +
+      `Step back: summarize what you've established, then take ONE concrete action.`;
+
+    try {
+      pi.sendMessage(
+        {
+          customType: "loop-reasoning-detected",
+          content: steerText,
+          display: true,
+          details: {
+            detector: "reasoning_repeat",
+            repeatCount,
+            sampleUnit,
+            when,
+            model: currentMessageModel,
+          },
+        },
+        { deliverAs: "nextTurn" },
+      );
+    } catch (e) {
+      log("warn", `sendMessage failed: ${(e as Error).message}`);
+    }
+
+  }
 }
