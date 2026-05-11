@@ -846,9 +846,13 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "hindsight_recall",
     label: "Hindsight Recall",
-    description: "Pull relevant context, conventions, or past decisions from project memory.",
+    description:
+      "Query the persistent memory bank for past decisions, conventions, bug fixes, or domain knowledge that may not be in the current context. " +
+      "Auto-recall only fires ONCE per session at session start, so call this tool explicitly whenever the user references prior work, conventions, or facts you do not immediately have. " +
+      "USE THIS TOOL when: (1) the user references past decisions/conventions/work you don't recall, (2) the auto-injected memories at session start are insufficient for the current sub-task, (3) you would otherwise say 'I don't know' or guess about project-specific facts. " +
+      "Cheap (<2s, ~few hundred tokens) — prefer over guessing. Do NOT spam: skip when the auto-injection already answers the question.",
     parameters: Type.Object({
-      query: Type.String({ description: "What to search for" }),
+      query: Type.String({ description: "Natural-language search query. Be specific — e.g. 'smart-compaction fallback policy' beats 'compaction'." }),
       bank: Type.Optional(Type.String({ description: "Specific bank to query (e.g. 'project-alpha', 'project-Pi-Agent'). Defaults to project + global banks." })),
       banks: Type.Optional(Type.Array(Type.String(), { description: "Multiple banks to query simultaneously." })),
     }),
