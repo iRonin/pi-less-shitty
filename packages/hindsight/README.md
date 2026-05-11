@@ -4,11 +4,12 @@ Integrates [Hindsight](https://github.com/vectorize-io/hindsight) into the Pi co
 
 ## What it does
 
-- **Auto-recall** — Before each agent turn, relevant memories from past sessions are injected into context
+- **Auto-recall** — Memories from past sessions are injected into context on the first user turn, and re-injected when a topic shift is detected (Phase F)
 - **Auto-retain** — After each agent turn, the conversation is saved to Hindsight (delta-only, append mode)
 - **Domain-aware isolation** — Memory is scoped by project via `.hindsight/config.toml` files with parent-traversal
-- **Manual tools** — `hindsight_recall`, `hindsight_retain`, `hindsight_reflect` for explicit control
-- **Commands** — `/hindsight status`, `/hindsight stats`, `/hindsight health`, `/hindsight reset` for monitoring and recovery
+- **Manual tools** — `hindsight_recall`, `hindsight_retain`, `hindsight_reflect`, `hindsight_promote` for explicit control
+- **Commands** — `/hindsight status`, `/hindsight stats`, `/hindsight health`, `/hindsight reset`, `/hindsight refresh` for monitoring and recovery
+- **Topic-shift recall** (Phase F) — jaccard-overlap + N-turn fallback + trigger-phrase heuristic re-fires recall mid-session when the topic drifts; bounded by cooldown to avoid thrash
 - **Health gate** (Phase C) — opt-in policy that blocks new prompts when hindsight silently fails, so you don't keep losing memory writes without noticing
 
 ## Prerequisites
@@ -90,6 +91,13 @@ In Pi, run:
 
 Should show bank name, server health, and hook status.
 
+## Recall lifecycle commands
+
+| Command | Effect |
+|---|---|
+| `/hindsight reset` | Clear the unhealthy flag (if any) AND reset the topic-shift recall state. Next turn fires fresh recall. |
+| `/hindsight refresh` | Like reset for the recall side only: forces the next user turn to fire a fresh recall regardless of topic-shift heuristic. Use when you want to manually pull fresh memories (mimics `/clear` for context). |
+
 ## Robustness settings (Phase C)
 
 User-tunable via `~/.pi/agent/hindsight.json`. Project-scoped overrides via flat snake_case keys in `.hindsight/config.toml` (project values win over user-wide JSON).
@@ -98,7 +106,14 @@ User-tunable via `~/.pi/agent/hindsight.json`. Project-scoped overrides via flat
 {
   "healthGate": "warn",
   "recallRetry": { "attempts": 3, "backoffMs": 1000 },
-  "recallTimeoutMs": 5000
+  "recallTimeoutMs": 5000,
+  "topicShiftRecall": {
+    "enabled": true,
+    "heuristic": "hybrid",
+    "cooldownSeconds": 60,
+    "everyNTurns": 8,
+    "jaccardThreshold": 0.2
+  }
 }
 ```
 
@@ -108,6 +123,11 @@ User-tunable via `~/.pi/agent/hindsight.json`. Project-scoped overrides via flat
 | `recallRetry.attempts` | `3` | Per-call retry attempts on transient errors (timeout, 5xx, network). Clamped 1–10. |
 | `recallRetry.backoffMs` | `1000` | Initial backoff between retries; doubles each attempt, capped at 30s. Clamped 0–60000. |
 | `recallTimeoutMs` | `5000` | Per-attempt timeout in ms (bumped from pre-Phase-C 2000ms — the root cause of the persistent `⚠ retrying` status bar; production recall against a real bank with remote LLM rerank typically takes 2.0–2.4s). Clamped 500–60000. |
+| `topicShiftRecall.enabled` | `true` | Phase F master switch. When false, auto-recall fires only on the first user turn (pre-F behavior). |
+| `topicShiftRecall.heuristic` | `"hybrid"` | `"jaccard"` — token-overlap only. `"hybrid"` — jaccard + N-turn fallback + high-precision trigger phrases. `"off"` — equivalent to `enabled: false`. |
+| `topicShiftRecall.cooldownSeconds` | `60` | Unconditional minimum interval between recalls. Beats every shift signal. Clamped 0–86400. |
+| `topicShiftRecall.everyNTurns` | `8` | Hybrid only: force a re-fire after this many turns regardless of similarity. Clamped 1–1000. |
+| `topicShiftRecall.jaccardThreshold` | `0.2` | Re-fire when token-set overlap drops below this. Clamped 0–1. |
 
 ### What marks hindsight UNHEALTHY?
 

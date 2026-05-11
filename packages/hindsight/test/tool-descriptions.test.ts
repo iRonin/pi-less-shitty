@@ -46,12 +46,12 @@ describe("hindsight_recall tool description (Phase E)", () => {
     assert.match(desc, /USE THIS TOOL when/i);
   });
 
-  test("flags that auto-recall only fires once per session", () => {
-    // This is the architectural fact that makes explicit recall necessary
-    // for any prompt after the first one in a session. If a future refactor
-    // makes auto-recall per-turn, this assertion correctly forces the
-    // description to be revisited.
-    assert.match(desc, /once per session|only.*session start|fires.*once/i);
+  test("explains the auto-recall firing model so the LLM knows when manual recall is needed", () => {
+    // Phase F: auto-recall is no longer once-per-session; it re-fires on
+    // detected topic shifts. The description must still communicate the
+    // firing model so the LLM understands when its injected context is
+    // likely stale and a manual recall is warranted.
+    assert.match(desc, /auto-recall|first user turn|topic shift|first turn/i);
   });
 
   test("warns against spamming the tool", () => {

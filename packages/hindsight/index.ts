@@ -22,6 +22,34 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { Type } from "@sinclair/typebox";
+import {
+  tokenizeForJaccard,
+  jaccardSimilarity,
+  shouldRecall,
+  normalizeHeuristic,
+  TOPIC_SHIFT_TRIGGER_RE,
+  DEFAULT_TOPIC_SHIFT_SETTINGS,
+} from "./heuristic.ts";
+import type {
+  TopicShiftHeuristic,
+  ShouldRecallInput,
+  ShouldRecallDecision,
+} from "./heuristic.ts";
+export {
+  tokenizeForJaccard,
+  jaccardSimilarity,
+  shouldRecall,
+  normalizeHeuristic,
+  TOPIC_SHIFT_TRIGGER_RE,
+  DEFAULT_TOPIC_SHIFT_SETTINGS,
+};
+// TopicShiftRecallSettings is re-exported via `export type { ... }` further
+// down (after HindsightSettings, which embeds it).
+export type {
+  TopicShiftHeuristic,
+  ShouldRecallInput,
+  ShouldRecallDecision,
+};
 
 // ─── Debug ───────────────────────────────────────────────────────────────
 
@@ -511,16 +539,35 @@ const hookStats: Record<string, HookStats> = { sessionStart: {}, recall: {}, ret
 
 export type HealthGate = "off" | "warn" | "block";
 
+// TopicShiftRecallSettings / TopicShiftHeuristic / normalizeHeuristic /
+// DEFAULT_TOPIC_SHIFT_SETTINGS / TOPIC_SHIFT_TRIGGER_RE / shouldRecall /
+// jaccardSimilarity / tokenizeForJaccard are imported from ./heuristic.ts
+// in the Phase F section further down and re-exported there.
+import type { TopicShiftRecallSettings as _TSR } from "./heuristic.ts";
+type TopicShiftRecallSettings = _TSR;
+
 export interface HindsightSettings {
   healthGate: HealthGate;
   recallRetry: { attempts: number; backoffMs: number };
   recallTimeoutMs: number;
+  topicShiftRecall: TopicShiftRecallSettings;
 }
+export type { TopicShiftRecallSettings };
 
 export const DEFAULT_SETTINGS: HindsightSettings = {
   healthGate: "warn",
   recallRetry: { attempts: 3, backoffMs: 1000 },
   recallTimeoutMs: 5000,
+  topicShiftRecall: {
+    // Backwards-compatible-by-thresholds: enabled on, but conservative knobs.
+    // Same-topic multi-turn conversations stay above the 0.2 jaccard floor,
+    // and the 60s cooldown prevents over-firing even on a sudden shift.
+    enabled: true,
+    heuristic: "hybrid",
+    cooldownSeconds: 60,
+    everyNTurns: 8,
+    jaccardThreshold: 0.2,
+  },
 };
 
 const SETTINGS_PATH = join(homedir(), ".pi", "agent", "hindsight.json");
@@ -535,6 +582,13 @@ export function normalizeHealthGate(v: unknown): HealthGate {
   return v === "off" || v === "block" || v === "warn" ? v : DEFAULT_SETTINGS.healthGate;
 }
 
+// normalizeHeuristic is imported from ./heuristic.ts further down.
+function clampFloat(v: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
 /**
  * Merge raw JSON / TOML overrides into a defaulted HindsightSettings shape.
  * Exported for direct unit testing.
@@ -547,6 +601,7 @@ export function buildSettings(
     healthGate: DEFAULT_SETTINGS.healthGate,
     recallRetry: { ...DEFAULT_SETTINGS.recallRetry },
     recallTimeoutMs: DEFAULT_SETTINGS.recallTimeoutMs,
+    topicShiftRecall: { ...DEFAULT_SETTINGS.topicShiftRecall },
   };
   if (jsonOverride) {
     if (jsonOverride.healthGate !== undefined) base.healthGate = normalizeHealthGate(jsonOverride.healthGate);
@@ -556,6 +611,14 @@ export function buildSettings(
     }
     if (jsonOverride.recallTimeoutMs !== undefined) {
       base.recallTimeoutMs = clampInt(jsonOverride.recallTimeoutMs, 500, 60_000, base.recallTimeoutMs);
+    }
+    if (jsonOverride.topicShiftRecall) {
+      const ts = jsonOverride.topicShiftRecall;
+      if (typeof ts.enabled === "boolean") base.topicShiftRecall.enabled = ts.enabled;
+      if (ts.heuristic !== undefined) base.topicShiftRecall.heuristic = normalizeHeuristic(ts.heuristic);
+      if (ts.cooldownSeconds !== undefined) base.topicShiftRecall.cooldownSeconds = clampInt(ts.cooldownSeconds, 0, 24 * 3600, base.topicShiftRecall.cooldownSeconds);
+      if (ts.everyNTurns !== undefined) base.topicShiftRecall.everyNTurns = clampInt(ts.everyNTurns, 1, 1000, base.topicShiftRecall.everyNTurns);
+      if (ts.jaccardThreshold !== undefined) base.topicShiftRecall.jaccardThreshold = clampFloat(ts.jaccardThreshold, 0, 1, base.topicShiftRecall.jaccardThreshold);
     }
   }
   if (tomlOverride) {
@@ -714,15 +777,35 @@ export async function recallBankWithRetry(
   return { outcome: "error", attempts: opts.attempts, lastErrorKind };
 }
 
+// ─── Phase F: Topic-Shift Heuristic ─────────────────────────────────────
+// Pure decision policy + types live in ./heuristic.ts (re-exported at top of
+// file so existing imports of these symbols from "pi-ironin-hindsight" keep
+// working). See heuristic.ts for the decision rules and rationale.
+
 // ─── Extension ───────────────────────────────────────────────────────────
 
 const MAX_RECALL_ATTEMPTS = 3;
 const authHeader = (key: string) => ({ "Authorization": `Bearer ${key || ""}` });
 
 export default function hindsightExtension(pi: ExtensionAPI) {
-  let recallDone = false;
-  let recallAttempts = 0;
+  // Phase F state machine. `recallEverFired` replaces the strict
+  // once-per-session `recallDone` gate from Phase E; we now also track when
+  // and on what prompt the last successful recall happened so the topic-shift
+  // heuristic (shouldRecall) can decide whether to re-fire on later turns.
+  let recallEverFired = false;
+  let recallAttempts = 0;        // attempts within the current decision window
+  let lastRecallPrompt = "";     // the prompt that triggered the last successful recall
+  let lastRecallAt = 0;          // Date.now() of last successful recall, 0 = never
+  let turnsSinceLastRecall = 0;  // user turns observed since last successful recall
   let currentPrompt = "";
+
+  function resetRecallState(): void {
+    recallEverFired = false;
+    recallAttempts = 0;
+    lastRecallPrompt = "";
+    lastRecallAt = 0;
+    turnsSinceLastRecall = 0;
+  }
 
   pi.on("input", async (event) => {
     currentPrompt = event.input ?? event.text ?? currentPrompt;
@@ -731,8 +814,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   // ─── Session lifecycle ─────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    recallDone = false;
-    recallAttempts = 0;
+    resetRecallState();
     hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
     hookStats.recall = {};
     hookStats.retain = {};
@@ -763,8 +845,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async () => {
-    recallDone = false;
-    recallAttempts = 0;
+    resetRecallState();
     log("session_compact: recall state reset");
   });
 
@@ -848,8 +929,8 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     label: "Hindsight Recall",
     description:
       "Query the persistent memory bank for past decisions, conventions, bug fixes, or domain knowledge that may not be in the current context. " +
-      "Auto-recall only fires ONCE per session at session start, so call this tool explicitly whenever the user references prior work, conventions, or facts you do not immediately have. " +
-      "USE THIS TOOL when: (1) the user references past decisions/conventions/work you don't recall, (2) the auto-injected memories at session start are insufficient for the current sub-task, (3) you would otherwise say 'I don't know' or guess about project-specific facts. " +
+      "Auto-recall fires on the first user turn and re-fires on detected topic shifts (jaccard < threshold, N-turn fallback, or trigger phrases), bounded by a cooldown. Call this tool explicitly when you need targeted context mid-turn or after a tool result reveals an unknown. " +
+      "USE THIS TOOL when: (1) the user references past decisions/conventions/work you don't recall, (2) the auto-injected memories are insufficient for the current sub-task, (3) you would otherwise say 'I don't know' or guess about project-specific facts. " +
       "Cheap (<2s, ~few hundred tokens) — prefer over guessing. Do NOT spam: skip when the auto-injection already answers the question.",
     parameters: Type.Object({
       query: Type.String({ description: "Natural-language search query. Be specific — e.g. 'smart-compaction fallback policy' beats 'compaction'." }),
@@ -902,17 +983,21 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const bank = p.bank || (p.scope === "global" && config.global_bank ? config.global_bank : getActiveBank(config));
       if (!bank) return { content: [{ type: "text" as const, text: "No bank_id configured." }], details: {}, isError: true };
       try {
+        // Use async:true server-side — kilocode-backed fact extraction takes 5–30s,
+        // which exceeds any reasonable client-side AbortSignal.timeout. Sub-Phase-D
+        // polling will catch silent failures asynchronously. Client returns as soon
+        // as hindsight has accepted the work (typically <200ms).
         const res = await fetch(`${config.api_url}/v1/default/banks/${bank}/memories`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeader(config.api_key) },
           body: JSON.stringify({
             items: [{ content: params.content, context: "pi: explicit retain", timestamp: new Date().toISOString() }],
-            async: false,
+            async: true,
           }),
           signal: AbortSignal.timeout(5000),
         });
         return res.ok
-          ? { content: [{ type: "text" as const, text: `Memory retained → ${bank}.` }], details: { bank, scope: p.bank ? "explicit" : (p.scope || "project") } }
+          ? { content: [{ type: "text" as const, text: `Memory queued → ${bank} (async; Phase D watcher will surface any silent failure).` }], details: { bank, scope: p.bank ? "explicit" : (p.scope || "project") } }
           : { content: [{ type: "text" as const, text: `Failed to retain to ${bank}.` }], details: {}, isError: true };
       } catch (e) {
         return { content: [{ type: "text" as const, text: `Error: ${e}` }], details: {}, isError: true };
@@ -1021,16 +1106,38 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   //      extracted or auth failure), abort the turn before recall.
   //   5. A successful recall flips healthState back to healthy — self-heals
   //      if the upstream LLM gateway recovers between turns.
-  pi.on("before_agent_start", async (_event, ctx) => {
-    if (recallDone || recallAttempts >= MAX_RECALL_ATTEMPTS) return;
+  pi.on("before_agent_start", async (event, ctx) => {
+    // Every user turn increments the counter; the heuristic decides whether
+    // this turn earns a fresh recall. Counter is reset on successful recall.
+    turnsSinceLastRecall++;
 
     const config = resolveConfig(process.cwd());
-    if (!config?.api_url) { recallAttempts = MAX_RECALL_ATTEMPTS; return; }
+    if (!config?.api_url) return;
 
     const banks = getRecallBanks(config);
-    if (!banks.length) { recallAttempts = MAX_RECALL_ATTEMPTS; return; }
+    if (!banks.length) return;
 
     const settings = loadSettings();
+
+    // ─── Phase F: topic-shift decision ────────────────────
+    // Use event.prompt (provided by pi for this exact turn) as the freshest
+    // signal; fall back to the session-tracked currentPrompt otherwise.
+    const heuristicPrompt = (event as any)?.prompt || currentPrompt || "";
+    const decision = shouldRecall({
+      currentPrompt: heuristicPrompt,
+      lastRecallPrompt,
+      lastRecallAt,
+      turnsSinceLastRecall,
+      now: Date.now(),
+      settings: settings.topicShiftRecall,
+    });
+    if (!decision.fire) {
+      log(`recall: skip (${decision.reason}${decision.detail ? ` ${decision.detail}` : ""})`);
+      return;
+    }
+    log(`recall: fire (${decision.reason}${decision.detail ? ` ${decision.detail}` : ""}, turn ${turnsSinceLastRecall})`);
+    // Each "fire" decision opens a fresh retry window.
+    recallAttempts = 0;
 
     // ─── Health Gate (block mode) ────────────────────
     // Check BEFORE incrementing recallAttempts or making any network call so
@@ -1062,7 +1169,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     }
 
     recallAttempts++;
-    const query = getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
+    const query = heuristicPrompt || getLastUserMessage(ctx, currentPrompt) || "Provide context for current project";
     log(`recall: attempt ${recallAttempts}/${MAX_RECALL_ATTEMPTS}, banks=${banks.join(",")}, retries=${settings.recallRetry.attempts}, timeout=${settings.recallTimeoutMs}ms`);
 
     type BankOutcome = "ok" | "auth-failed" | "error";
@@ -1106,8 +1213,11 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const allAuthFailed = authFailedBanks.length === banks.length;
 
       if (allAuthFailed) {
-        // Every bank rejected our credentials — no point retrying this session.
-        recallAttempts = MAX_RECALL_ATTEMPTS;
+        // Every bank rejected our credentials — credential is wrong, no point
+        // retrying. Park lastRecallAt at "infinity" via a huge cooldown sentinel
+        // so subsequent turns don't keep hammering: only /hindsight reset
+        // clears this state (auth doesn't fix itself between prompts).
+        lastRecallAt = Date.now() + 24 * 3600 * 1000; // 24h in the future
         hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "auth error" };
         ctx.ui.setStatus("hindsight", "✗ auth error");
         if (settings.healthGate !== "off") markUnhealthy("auth error on all banks");
@@ -1115,7 +1225,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       }
 
       if (anyOk) {
-        recallDone = true;
+        // Phase F bookkeeping: a successful recall closes the cooldown window
+        // and resets the turn counter. Re-firing on the very next turn now
+        // requires either a real topic shift or expiry of the cooldown.
+        const isRefire = recallEverFired;
+        recallEverFired = true;
+        lastRecallPrompt = heuristicPrompt;
+        lastRecallAt = Date.now();
+        turnsSinceLastRecall = 0;
         // Successful recall → self-heal. Clears unhealthy flag from a prior
         // zero-units-extracted retain or transient recall failure, so the user doesn't
         // need to /hindsight reset once the upstream LLM gateway recovers.
@@ -1124,14 +1241,21 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           const detail = authFailedBanks.length
             ? `${allResults.length} memories (auth failed: ${authFailedBanks.join(",")})`
             : `${allResults.length} memories`;
-          hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail };
+          hookStats.recall = { firedAt: new Date().toISOString(), result: "ok", detail: isRefire ? `${detail} [refire: ${decision.reason}]` : detail };
+          // On a topic-shift re-fire, surface a brief status flash so the
+          // user can see the new injection. First-turn recall keeps the
+          // session_start `🧠 bank` status untouched.
+          if (isRefire) {
+            const bank = getActiveBank(config);
+            ctx.ui.setStatus?.("hindsight", `🧠 +${allResults.length}${bank ? ` (${bank})` : ""}`);
+          }
           const snippet = allResults.slice(0, 3).map((r: string) => r.replace(/^\[[^\]]+\] /, "")).join(" · ").slice(0, 200);
           return {
             message: {
               customType: "hindsight-recall",
               content: `<hindsight_memories>\nRelevant memories from past sessions:\n\n${allResults.join("\n\n")}\n</hindsight_memories>`,
               display: true,
-              details: { count: allResults.length, snippet, memories: allResults },
+              details: { count: allResults.length, snippet, memories: allResults, refire: isRefire, reason: decision.reason },
             },
           };
         }
@@ -1141,18 +1265,22 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           detail: authFailedBanks.length ? `empty (auth failed: ${authFailedBanks.join(",")})` : "empty",
         };
       } else {
-        const isLast = recallAttempts >= MAX_RECALL_ATTEMPTS;
-        hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: isLast ? "unreachable" : "retrying" };
-        ctx.ui.setStatus("hindsight", isLast ? "✗ unreachable" : "⚠ retrying");
-        // Only mark unhealthy on the FINAL session attempt — transient
-        // failures during earlier turns shouldn't gate subsequent prompts.
-        if (isLast && settings.healthGate !== "off") markUnhealthy("recall exhausted retries");
+        // All banks failed (network/timeout/5xx). recallBankWithRetry already
+        // exhausted its internal retry budget; one fire = one terminal failure.
+        // Park lastRecallAt = now so the cooldown gate prevents thrashing on
+        // every subsequent turn. Recovery: next turn after `cooldownSeconds`
+        // re-evaluates shouldRecall — jaccard against the empty
+        // lastRecallPrompt returns 0, so it will fire again if/when needed.
+        lastRecallAt = Date.now();
+        hookStats.recall = { firedAt: new Date().toISOString(), result: "failed", detail: "unreachable" };
+        ctx.ui.setStatus("hindsight", "✗ unreachable");
+        if (settings.healthGate !== "off") markUnhealthy("recall exhausted retries");
       }
     } catch (e) {
-      const isLast = recallAttempts >= MAX_RECALL_ATTEMPTS;
-      ctx.ui.setStatus("hindsight", isLast ? "✗ unreachable" : "⚠ retrying");
+      lastRecallAt = Date.now();
+      ctx.ui.setStatus("hindsight", "✗ unreachable");
       log(`recall: error ${e}`);
-      if (isLast && settings.healthGate !== "off") markUnhealthy("recall threw");
+      if (settings.healthGate !== "off") markUnhealthy("recall threw");
     }
   });
 
@@ -1254,7 +1382,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   // ─── Commands ──────────────────────────────────────────────────────
 
   pi.registerCommand("hindsight", {
-    description: "Hindsight memory status. Usage: /hindsight [status|stats|health|reset]",
+    description: "Hindsight memory status. Usage: /hindsight [status|stats|health|reset|refresh]",
     handler: async (args: any, ctx) => {
       const config = resolveConfig(process.cwd());
       if (!config) { ctx.ui.notify("Hindsight not configured — no .hindsight/config.toml in path.", "warning"); return; }
@@ -1265,30 +1393,44 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         const wasHealthy = healthState.healthy;
         const prevReason = healthState.reason;
         markHealthy();
-        recallDone = false;
-        recallAttempts = 0;
+        resetRecallState();
         ctx.ui.setStatus?.("hindsight", `🧠 ${getActiveBank(config) || ""}`.trim() || undefined);
         ctx.ui.notify(
           wasHealthy
-            ? "Hindsight already healthy. Recall counter reset."
-            : `Hindsight unhealthy flag cleared (was: ${prevReason}). Recall counter reset.`,
+            ? "Hindsight already healthy. Recall state reset — next turn will fire fresh recall."
+            : `Hindsight unhealthy flag cleared (was: ${prevReason}). Recall state reset.`,
           "info",
         );
         return;
       }
 
+      if (sub === "refresh") {
+        // Like /hindsight reset for the recall side: forces the next user
+        // turn to fire a fresh recall regardless of topic-shift heuristic.
+        // Mirrors the Phase F design note "/clear explicitly resets the
+        // recallDone flag" — pi has no global /clear, but this matches.
+        resetRecallState();
+        ctx.ui.setStatus?.("hindsight", `🧠 ${getActiveBank(config) || ""}`.trim() || undefined);
+        ctx.ui.notify("Hindsight recall state cleared — next turn will fire a fresh recall.", "info");
+        return;
+      }
+
       if (sub === "health") {
         const s = loadSettings();
+        const ts = s.topicShiftRecall;
         const lines = [
           `Health: ${healthState.healthy ? "✓ healthy" : `✗ unhealthy (${healthState.reason})`}`,
           healthState.markedAt ? `Marked: ${healthState.markedAt}` : "",
           "",
           `Settings (~/.pi/agent/hindsight.json):`,
-          `  healthGate:      ${s.healthGate}`,
-          `  recallRetry:     attempts=${s.recallRetry.attempts}, backoffMs=${s.recallRetry.backoffMs}`,
-          `  recallTimeoutMs: ${s.recallTimeoutMs}`,
+          `  healthGate:        ${s.healthGate}`,
+          `  recallRetry:       attempts=${s.recallRetry.attempts}, backoffMs=${s.recallRetry.backoffMs}`,
+          `  recallTimeoutMs:   ${s.recallTimeoutMs}`,
+          `  topicShiftRecall:  enabled=${ts.enabled}, heuristic=${ts.heuristic}, cooldown=${ts.cooldownSeconds}s, everyN=${ts.everyNTurns}, jaccard<${ts.jaccardThreshold}`,
           "",
-          `Reset with: /hindsight reset`,
+          `Recall state: everFired=${recallEverFired}, lastAt=${lastRecallAt ? new Date(lastRecallAt).toISOString() : "never"}, turnsSince=${turnsSinceLastRecall}`,
+          "",
+          `Reset with: /hindsight reset    Force re-recall: /hindsight refresh`,
         ].filter(Boolean);
         ctx.ui.notify(lines.join("\n"), "info");
         return;
@@ -1360,7 +1502,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui.notify(`Bank: ${getActiveBank(config) || "none"}\nGlobal: ${config.global_bank || "none"}\nRecall: ${getRecallBanks(config).join(", ")}\nHealth: ${healthState.healthy ? "✓" : `✗ ${healthState.reason}`}\n/hindsight status | stats | health | reset`, "info");
+      ctx.ui.notify(`Bank: ${getActiveBank(config) || "none"}\nGlobal: ${config.global_bank || "none"}\nRecall: ${getRecallBanks(config).join(", ")}\nHealth: ${healthState.healthy ? "✓" : `✗ ${healthState.reason}`}\n/hindsight status | stats | health | reset | refresh`, "info");
     },
   });
 }
