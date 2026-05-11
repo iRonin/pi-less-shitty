@@ -208,6 +208,187 @@ function shouldSkipRetain(prompt: string | null): { skip: boolean; reason?: stri
   return { skip: false };
 }
 
+// ─── Operation Polling (Silent-Failure Detection — Phase B) ────────────
+//
+// Hindsight's POST /memories with async:true returns HTTP 200 + an operation_id.
+// The server then runs LLM fact extraction in the background. If extraction
+// fails (LLM down, budget exhausted, model misconfig) the operation can either:
+//   - be marked `failed` with an error_message, or
+//   - be marked `completed` with zero facts extracted (silent failure — the
+//     4-day bug we are fixing).
+//
+// Detection rule (verified empirically against vectorize-io/hindsight:latest):
+//   `result_metadata.unit_ids_count` is only written by the streaming retain
+//   path when at least one fact is committed (orchestrator.py line ~1128:
+//   `if operation_id and all_unit_ids`). For a parent batch_retain operation,
+//   the parent's own result_metadata never carries this field — we aggregate
+//   across child_operations instead.
+//
+//   completed + (∑ child unit_ids_count) === 0  →  zero-facts alert
+//   completed + no child has any unit_ids_count → zero-facts alert (matches
+//     the actual production bug pattern: 0-fact retains have the field absent)
+//   completed + ∑ unit_ids_count >= 1           →  silent happy path
+//   failed                                       →  failed alert with error_message
+//   timeout                                      →  debug log only
+//
+// All polling runs in the background, never awaited by agent_end.
+
+const POLL_INTERVAL_MS = 5000;
+const POLL_MAX_ATTEMPTS = 24; // 5s * 24 = 120s
+
+interface OperationStatusResponse {
+  operation_id: string;
+  status: "pending" | "completed" | "failed" | "not_found" | string;
+  operation_type?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+  result_metadata?: Record<string, unknown> | null;
+  child_operations?: Array<{ operation_id: string; status: string; error_message?: string | null }> | null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function fetchOperation(
+  apiUrl: string,
+  apiKey: string,
+  bank: string,
+  operationId: string,
+): Promise<OperationStatusResponse | null> {
+  try {
+    const res = await fetch(
+      `${apiUrl}/v1/default/banks/${bank}/operations/${operationId}`,
+      { headers: authHeader(apiKey), signal: AbortSignal.timeout(5000) },
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as OperationStatusResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Aggregate `unit_ids_count` across an operation and (if present) its children.
+ * Returns:
+ *   - number  ≥ 0   when at least one operation in the tree exposed the field
+ *   - null          when no operation in the tree exposed the field
+ *                   (treated as zero-facts in production: matches the bug pattern)
+ */
+async function aggregateUnitsCount(
+  apiUrl: string,
+  apiKey: string,
+  bank: string,
+  op: OperationStatusResponse,
+): Promise<number | null> {
+  let total = 0;
+  let anyFieldSeen = false;
+
+  const direct = op.result_metadata?.unit_ids_count;
+  if (typeof direct === "number") { total += direct; anyFieldSeen = true; }
+
+  if (Array.isArray(op.child_operations) && op.child_operations.length > 0) {
+    // Children are returned WITHOUT result_metadata — fetch each one.
+    for (const child of op.child_operations) {
+      const childOp = await fetchOperation(apiUrl, apiKey, bank, child.operation_id);
+      const c = childOp?.result_metadata?.unit_ids_count;
+      if (typeof c === "number") { total += c; anyFieldSeen = true; }
+    }
+  }
+
+  return anyFieldSeen ? total : null;
+}
+
+/**
+ * Poll one operation until terminal status or POLL_MAX_ATTEMPTS attempts.
+ * Returns the final OperationStatusResponse on terminal status, or null on timeout.
+ */
+async function pollOperationUntilTerminal(
+  apiUrl: string,
+  apiKey: string,
+  bank: string,
+  operationId: string,
+): Promise<OperationStatusResponse | null> {
+  for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
+    await sleep(POLL_INTERVAL_MS);
+    const op = await fetchOperation(apiUrl, apiKey, bank, operationId);
+    if (!op) continue;
+    if (op.status === "completed" || op.status === "failed" || op.status === "not_found") {
+      return op;
+    }
+  }
+  return null;
+}
+
+/**
+ * Background task: poll a single retain operation and surface failures.
+ * `t0` is `Date.now()` at the moment the retain POST returned HTTP 200.
+ */
+async function watchRetainOperation(
+  pi: ExtensionAPI,
+  ctx: any,
+  config: ResolvedConfig,
+  bank: string,
+  operationId: string,
+  t0: number,
+): Promise<void> {
+  try {
+    const op = await pollOperationUntilTerminal(config.api_url, config.api_key, bank, operationId);
+    const op_age_ms = Date.now() - t0;
+
+    if (!op) {
+      // 120s elapsed and still pending — debug log only, no user notification.
+      log(`retain-poll: timeout op=${operationId} bank=${bank} age_ms=${op_age_ms} status=pending`);
+      return;
+    }
+
+    if (op.status === "failed") {
+      const errMsg = op.error_message || "(no error_message)";
+      log(`retain-poll: failed op=${operationId} bank=${bank} age_ms=${op_age_ms} error=${errMsg}`);
+      try { ctx.ui.setStatus?.("hindsight", "⚠ retain failed"); } catch {}
+      pi.sendMessage(
+        {
+          customType: "hindsight-retain-failed-async",
+          content: "",
+          display: true,
+          details: { bank, operation_id: operationId, op_age_ms, error_message: errMsg },
+        },
+        { deliverAs: "nextTurn" },
+      );
+      return;
+    }
+
+    if (op.status === "not_found") {
+      log(`retain-poll: not_found op=${operationId} bank=${bank} age_ms=${op_age_ms}`);
+      return;
+    }
+
+    // status === "completed" — check whether any facts were retained.
+    const units = await aggregateUnitsCount(config.api_url, config.api_key, bank, op);
+    if (units === null || units === 0) {
+      log(`retain-poll: zero-facts op=${operationId} bank=${bank} age_ms=${op_age_ms} units=${units}`);
+      try { ctx.ui.setStatus?.("hindsight", "⚠ 0 facts retained"); } catch {}
+      pi.sendMessage(
+        {
+          customType: "hindsight-retain-zero-facts",
+          content: "",
+          display: true,
+          details: { bank, operation_id: operationId, op_age_ms, units_count: units },
+        },
+        { deliverAs: "nextTurn" },
+      );
+      return;
+    }
+
+    // Happy path — silent.
+    log(`retain-poll: ok op=${operationId} bank=${bank} age_ms=${op_age_ms} units=${units}`);
+  } catch (e) {
+    log(`retain-poll: watcher error op=${operationId} bank=${bank} ${e}`);
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
 const OPERATIONAL_TOOLS = new Set([
@@ -316,6 +497,26 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     t += theme.fg("muted", " retain failed — use ");
     t += theme.fg("accent", "hindsight_retain");
     t += theme.fg("muted", " to save manually");
+    return new Text(t, 0, 0);
+  });
+
+  pi.registerMessageRenderer("hindsight-retain-zero-facts", (msg, _opt, theme) => {
+    const d = (msg.details as any) ?? {};
+    let t = theme.fg("warning", "⚠ Hindsight");
+    t += theme.fg("muted", " retain completed but 0 facts extracted");
+    if (d.bank) t += theme.fg("dim", ` → ${d.bank}`);
+    if (typeof d.op_age_ms === "number") t += theme.fg("dim", ` (${Math.round(d.op_age_ms / 1000)}s)`);
+    t += "\n" + theme.fg("dim", "  LLM extraction likely failed silently — check ~/Work/llm-mode.sh status");
+    return new Text(t, 0, 0);
+  });
+
+  pi.registerMessageRenderer("hindsight-retain-failed-async", (msg, _opt, theme) => {
+    const d = (msg.details as any) ?? {};
+    let t = theme.fg("error", "✗ Hindsight");
+    t += theme.fg("muted", " retain operation failed");
+    if (d.bank) t += theme.fg("dim", ` → ${d.bank}`);
+    if (typeof d.op_age_ms === "number") t += theme.fg("dim", ` (${Math.round(d.op_age_ms / 1000)}s)`);
+    if (d.error_message) t += "\n" + theme.fg("dim", `  ${String(d.error_message).slice(0, 300)}`);
     return new Text(t, 0, 0);
   });
 
@@ -608,6 +809,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     log(`retain: banks=${banks.join(",")} len=${transcript.length} tags=${tags.join(",")}`);
 
     try {
+      const t0 = Date.now();
       const results = await Promise.allSettled(
         banks.map(async (b) => {
           const res = await fetch(`${config.api_url}/v1/default/banks/${b}/memories`, {
@@ -627,11 +829,20 @@ export default function hindsightExtension(pi: ExtensionAPI) {
             signal: AbortSignal.timeout(5000),
           });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          return b;
+          // Capture operation_id from RetainResponse so we can poll for silent failures.
+          let operationId: string | null = null;
+          try {
+            const data = await res.json() as { operation_id?: string | null; operation_ids?: string[] | null };
+            operationId = data.operation_id || (Array.isArray(data.operation_ids) ? data.operation_ids[0] : null) || null;
+          } catch { /* response body not JSON — proceed without polling */ }
+          return { bank: b, operationId };
         }),
       );
 
-      const ok = results.filter(r => r.status === "fulfilled").map(r => (r as PromiseFulfilledResult<string>).value);
+      const fulfilled = results
+        .filter((r): r is PromiseFulfilledResult<{ bank: string; operationId: string | null }> => r.status === "fulfilled")
+        .map(r => r.value);
+      const ok = fulfilled.map(v => v.bank);
       hookStats.retain = { firedAt: new Date().toISOString(), result: ok.length ? "ok" : "failed", detail: ok.join(", ") };
 
       if (ok.length) {
@@ -640,6 +851,16 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       } else {
         ctx.ui.setStatus("hindsight", "⚠ retain failed");
         pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
+      }
+
+      // ─── Phase B: background polling for silent failures ─────────────
+      // No await — these promises run after agent_end returns.
+      for (const { bank: b, operationId } of fulfilled) {
+        if (!operationId) {
+          log(`retain: bank=${b} no operation_id in response — skipping watcher`);
+          continue;
+        }
+        void watchRetainOperation(pi, ctx, config, b, operationId, t0);
       }
     } catch (e) {
       log(`retain: error ${e}`);
