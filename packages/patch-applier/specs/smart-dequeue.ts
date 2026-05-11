@@ -13,9 +13,14 @@ import type { PatchSpec } from "../src/types.js";
  *     messages do follow-up messages start coming back.
  *   • Compaction-queued messages of the matching mode are popped before
  *     session-queued ones in the same pool (they're newer in practical terms).
- *   • A repeat press within ~500 ms appends the next popped message to the
- *     editor's current text instead of replacing it (the user is rapidly
- *     dragging items back; replace would clobber what they already have).
+ *   • If the editor already has non-empty content when the message is
+ *     popped (because the user typed something or already pulled a previous
+ *     queue item back), the popped message is APPENDED after a blank line
+ *     rather than replacing the existing text. This is the primary
+ *     non-destructive guard. A repeat press within ~500 ms is retained as
+ *     a redundant trigger for append mode, but is no longer the only path:
+ *     the helper must not destroy editor content even on a single slow
+ *     press when the editor is non-empty.
  *
  * The patch introduces one durable named hook that the spec verifies against:
  *
@@ -50,15 +55,21 @@ export const spec: PatchSpec = {
 		"message must come back before the first follow-up message does), within each queue the " +
 		"newest-queued item comes back first (LIFO), and within the same mode pool compaction-" +
 		"queued messages (whatever shape pi currently uses for those) are popped before session-" +
-		"queued ones. A repeat press within ~500 ms must APPEND the popped message to the " +
-		"editor's existing text instead of replacing it. The bulk-restore path that pi calls " +
+		"queued ones. CRITICAL non-destructive guard: whenever the editor already has " +
+		"non-empty content at pop time (the user typed something OR previously pulled a queue " +
+		"item back), the popped message MUST be APPENDED after a blank line rather than " +
+		"replacing the existing text — Alt+Up must never destroy what is already in the editor. " +
+		"A repeat press within ~500 ms is also retained as a redundant trigger for append mode, " +
+		"but it is no longer the only path: a single slow press into a non-empty editor still " +
+		"appends. The bulk-restore path that pi calls " +
 		"internally on abort (e.g. when the user cancels a streaming response and expects all " +
 		"queued messages back in the editor at once) MUST still work — only the interactive " +
 		"Alt+Up handler changes its semantics. The patch introduces a single named hook on the " +
 		"interactive-mode instance that other code (and the verify function) can rely on: a " +
 		"helper method `popOneQueuedMessageToEditor(options)` that takes an optional " +
 		"`{ append?: boolean }` discriminator, performs the LIFO pop with steer-first ordering, " +
-		"writes the popped message into the editor (replace or append), drains-and-re-queues the " +
+		"writes the popped message into the editor (replace only when the editor is empty, " +
+		"append otherwise), drains-and-re-queues the " +
 		"survivors so pi's queue state stays consistent, and returns " +
 		"`{ popped, source, remaining }` where `popped` is the popped text or null when the " +
 		"queues were empty, `source` is the string `\"steer\"` or `\"follow-up\"`, and " +
@@ -76,6 +87,9 @@ export const spec: PatchSpec = {
 		"`this.__smartDequeueLastPress` and switches to append mode when the gap is < 500 ms, " +
 		"a single call to `this.popOneQueuedMessageToEditor({ append })`, and a status update " +
 		"that reports what was popped (`steer`/`follow-up`) and how many messages remain. " +
+		"NOTE: the helper itself ALSO appends whenever the editor has non-empty content, so the " +
+		"handler may pass `append: false` and the helper will still preserve typed text — the " +
+		"quick-press flag is a hint, not the sole determinant. " +
 		"Add the `popOneQueuedMessageToEditor` helper to the same class. Inside the helper: " +
 		"read steer messages, follow-up messages, and the compaction-queued list from whatever " +
 		"symbols the current pi exposes (discover them by reading the file — typical names are " +
@@ -88,7 +102,8 @@ export const spec: PatchSpec = {
 		"`session.steer(text)` / `session.followUp(text)` (or whatever the current equivalents " +
 		"are); rebuild the compaction-queued list from the survivors; insert the popped text " +
 		"into `this.editor` (replace by default, append-after-blank-line when `options.append` " +
-		"is true); call `this.updatePendingMessagesDisplay()` if it exists so the queue UI " +
+		"is true OR when the editor's current text is non-empty — never destroy typed text); " +
+		"call `this.updatePendingMessagesDisplay()` if it exists so the queue UI " +
 		"refreshes; return `{ popped, source, remaining }`. Wrap the helper body in try/catch " +
 		"so that if upstream renames internal symbols the helper no-ops returning " +
 		"`{ popped: null, source: null, remaining: 0 }` instead of crashing pi. Keep the " +
@@ -182,6 +197,98 @@ export const spec: PatchSpec = {
 				"would replace each other; expected a Date.now() delta compared against a " +
 				"~500ms threshold to switch to append mode",
 			);
+		}
+
+		// 6. Non-destructive guard: somewhere in the same file, the helper
+		//    must read the current editor text AND write back a value that
+		//    contains that current text concatenated with the popped
+		//    message. Without this, a future re-derivation could silently
+		//    drop the append branch and Alt+Up would clobber typed text —
+		//    which is the exact UX bug this spec exists to prevent.
+		//    We scope this check to the region from the helper's definition
+		//    onward, but use a brace-balanced extraction so nested blocks
+		//    don't truncate the body capture. There is only one method
+		//    named `popOneQueuedMessageToEditor` in the file (the verify
+		//    above checks the name is used at least twice — once defined,
+		//    once called — not three times), so this region is unambiguous.
+		const helperBody = (() => {
+			const sigRe = /popOneQueuedMessageToEditor\s*\([^)]*\)\s*\{/g;
+			const m = sigRe.exec(content);
+			if (!m) return "";
+			let depth = 1;
+			let i = m.index + m[0].length;
+			const maxScan = Math.min(content.length, i + 12000);
+			for (; i < maxScan && depth > 0; i++) {
+				const c = content[i];
+				if (c === "{") depth++;
+				else if (c === "}") depth--;
+			}
+			return content.slice(m.index + m[0].length, i);
+		})();
+		if (helperBody) {
+			const readsCurrentText = /\.editor\.getText\s*\(\s*\)/.test(helperBody);
+			// Look for a blank-line-separated concatenation of two interpolated
+			// values (template-literal `${X}\n\n${Y}` form) or a string-concat
+			// form X + "\n\n" + Y. Pattern matches whether the result is
+			// assigned to a temp variable or inlined into setText().
+			const appendsConcat =
+				/`\$\{[^}]+\}\\n\\n\$\{[^}]+\}`/.test(helperBody) ||
+				/\+\s*["'`]\\n\\n["'`]\s*\+/.test(helperBody);
+			const writesEditor = /\.editor\.setText\s*\(/.test(helperBody);
+			// The append branch must be reachable from editor-content state
+			// alone — NOT gated solely on the rapid-press hint. Otherwise a
+			// single slow press into a non-empty editor would destroy typed
+			// text. We approximate this by requiring a conditional whose
+			// predicate mentions a text-length/trim check that does NOT also
+			// mention the rapid-press hint variable (`append`). Concretely:
+			// look for any of these forms in the helper body:
+			//   currentText.trim()
+			//   currentText.length
+			//   <some>.trim().length
+			// AND require that the FIRST predicate guarding the concat form
+			// does NOT have `append` AND'd with a length/trim check. The
+			// (append && currentText.length > 0) form is the bug pattern.
+			const checksEditorEmptiness =
+				/\.trim\s*\(\s*\)(?:\.length)?/.test(helperBody) ||
+				/\.length\s*[<>=!]/.test(helperBody) ||
+				/\.length\s*===?\s*0/.test(helperBody);
+			const bugPattern =
+				/\bappend\s*&&\s*[A-Za-z_$][\w$]*\.(?:length|trim)/.test(helperBody);
+			if (!readsCurrentText) {
+				failures.push(
+					"Helper 'popOneQueuedMessageToEditor' never reads the current editor text " +
+					"(no `this.editor.getText()` call inside its body) — it cannot append to existing " +
+					"content, which means Alt+Up would destroy typed text",
+				);
+			}
+			if (!appendsConcat || !writesEditor) {
+				failures.push(
+					"Helper 'popOneQueuedMessageToEditor' has no append branch: expected an " +
+					"expression concatenating the current editor text with the popped message " +
+					"separated by a blank line (e.g. `` `${current}\\n\\n${popped}` `` or " +
+					"`current + \"\\n\\n\" + popped`) plus a `this.editor.setText(...)` call to " +
+					"write it back. Without this the append branch is missing and Alt+Up would " +
+					"destroy typed text",
+				);
+			}
+			if (!checksEditorEmptiness) {
+				failures.push(
+					"Helper 'popOneQueuedMessageToEditor' has no editor-emptiness check " +
+					"(expected a `.trim()` / `.length` predicate that gates the append branch " +
+					"on whether the editor already has content) — without this the append branch " +
+					"only fires on rapid press, and a single slow press into a non-empty editor " +
+					"would destroy typed text",
+				);
+			}
+			if (bugPattern) {
+				failures.push(
+					"Helper 'popOneQueuedMessageToEditor' gates the append branch on the " +
+					"rapid-press hint (`append && X.length` or `append && X.trim` pattern). " +
+					"This is the user-reported bug: a single slow press into a non-empty editor " +
+					"destroys typed text. The append branch must be reachable from editor " +
+					"content alone (e.g. `currentText.trim().length > 0 ? ... : ...`)",
+				);
+			}
 		}
 
 		return failures.length === 0 ? { ok: true } : { ok: false, failures };

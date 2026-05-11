@@ -164,8 +164,10 @@ const PATCHED_RESTORE_AND_HELPERS = `    restoreQueuedMessagesToEditor(options) 
             for (const t of compactionSteer) newCompaction.push({ mode: "steer", text: t });
             for (const t of compactionFollowUp) newCompaction.push({ mode: "followUp", text: t });
             this.compactionQueuedMessages = newCompaction;
+            // Non-destructive guard: if the editor already has content,
+            // always append after a blank line. Never destroy typed text.
             const currentText = this.editor.getText();
-            const newText = (append && currentText.trim()) ? \`\${currentText}\\n\\n\${popped}\` : popped;
+            const newText = currentText.trim().length > 0 ? \`\${currentText}\\n\\n\${popped}\` : popped;
             this.editor.setText(newText);
             if (typeof this.updatePendingMessagesDisplay === "function") this.updatePendingMessagesDisplay();
             const remaining = sessionSteer.length + sessionFollowUp.length + compactionSteer.length + compactionFollowUp.length;
@@ -291,8 +293,10 @@ class InteractiveMode {
             for (const t of cs) np.push({ mode: "steer", text: t });
             for (const t of cf) np.push({ mode: "followUp", text: t });
             this.pendingCompactionMessages = np;
+            // Non-destructive guard: if the editor already has content,
+            // always append. Never destroy typed text.
             const cur = this.editor.getText();
-            this.editor.setText((append && cur.trim()) ? \`\${cur}\\n\\n\${popped}\` : popped);
+            this.editor.setText(cur.trim().length > 0 ? \`\${cur}\\n\\n\${popped}\` : popped);
             return { popped, source, remaining: ss.length + fu.length + cs.length + cf.length };
         }
         catch (e) {
@@ -401,6 +405,102 @@ describe("smart-dequeue spec.verify", () => {
 		const r = smartDequeueSpec.verify(coexisting);
 		assert.equal(r.ok, true, !r.ok ? r.failures.join("; ") : undefined);
 	});
+
+	// REGRESSION 1: the exact "verbatim user bug" — the helper exists,
+	// quick-press detector is wired, append branch is present, but the
+	// append branch is GATED on the rapid-press hint. Single slow press
+	// into a non-empty editor still destroys typed text. This was the
+	// state of the dist BEFORE the May-2026 fix.
+	test("rejects patch where append branch is gated on rapid-press hint (slow press destroys typed text)", () => {
+		const BUGGY_HELPER = `    popOneQueuedMessageToEditor(options) {
+        try {
+            const append = options?.append === true;
+            const session = this.session;
+            const sessionSteer = session && typeof session.getSteeringMessages === "function" ? [...session.getSteeringMessages()] : [];
+            const sessionFollowUp = session && typeof session.getFollowUpMessages === "function" ? [...session.getFollowUpMessages()] : [];
+            let popped = null;
+            let source = null;
+            if (sessionSteer.length > 0) { popped = sessionSteer.pop(); source = "steer"; }
+            else if (sessionFollowUp.length > 0) { popped = sessionFollowUp.pop(); source = "follow-up"; }
+            if (popped == null) return { popped: null, source: null, remaining: 0 };
+            const currentText = this.editor.getText();
+            // BUG: append only when rapid-press hint is set. Slow press into
+            // non-empty editor replaces (destroys typed text).
+            if (append && currentText.length > 0) {
+                this.editor.setText(\`\${currentText}\\n\\n\${popped}\`);
+            }
+            else {
+                this.editor.setText(popped);
+            }
+            return { popped, source, remaining: sessionSteer.length + sessionFollowUp.length };
+        }
+        catch (e) {
+            return { popped: null, source: null, remaining: 0 };
+        }
+    }`;
+		const BUGGY = PATCHED.replace(
+			/    popOneQueuedMessageToEditor\(options\) \{[\s\S]*?\n    \}/,
+			BUGGY_HELPER,
+		);
+		assert.ok(BUGGY.includes(BUGGY_HELPER), "fixture sanity: helper body replaced");
+		const r = smartDequeueSpec.verify(BUGGY);
+		assert.equal(r.ok, false);
+		if (!r.ok) {
+			assert.ok(
+				r.failures.some((f) => /rapid-press hint|append && X\.|gates the append/.test(f)),
+				`expected failure mentioning the append-gated-on-rapid-press bug pattern; got: ${r.failures.join("; ")}`,
+			);
+		}
+	});
+
+	// REGRESSION 2: helper drops the append branch entirely — silently
+	// replaces every time. Verify must reject so a re-derivation that
+	// drops the append branch cannot land unnoticed.
+	test("rejects regressed patch where helper destroys typed text (always replaces)", () => {
+		const REGRESSED_HELPER = `    popOneQueuedMessageToEditor(options) {
+        try {
+            const session = this.session;
+            const sessionSteer = session && typeof session.getSteeringMessages === "function" ? [...session.getSteeringMessages()] : [];
+            const sessionFollowUp = session && typeof session.getFollowUpMessages === "function" ? [...session.getFollowUpMessages()] : [];
+            let popped = null;
+            let source = null;
+            if (sessionSteer.length > 0) { popped = sessionSteer.pop(); source = "steer"; }
+            else if (sessionFollowUp.length > 0) { popped = sessionFollowUp.pop(); source = "follow-up"; }
+            if (popped == null) return { popped: null, source: null, remaining: 0 };
+            // BUG: always replaces. No editor text read, no append branch.
+            this.editor.setText(popped);
+            return { popped, source, remaining: sessionSteer.length + sessionFollowUp.length };
+        }
+        catch (e) {
+            return { popped: null, source: null, remaining: 0 };
+        }
+    }`;
+		const REGRESSED = PATCHED.replace(
+			/    popOneQueuedMessageToEditor\(options\) \{[\s\S]*?\n    \}/,
+			REGRESSED_HELPER,
+		);
+		// Sanity: the regressed fixture still has the helper name & quick-press
+		// detector, so without the new check verify would falsely pass.
+		assert.ok(REGRESSED.includes("popOneQueuedMessageToEditor"), "fixture sanity");
+		assert.ok(/Date\.now\(\)/.test(REGRESSED), "fixture sanity");
+		assert.ok(REGRESSED.includes(REGRESSED_HELPER), "fixture sanity: helper body actually replaced");
+		// The regressed helper itself contains no getText / append concat —
+		// that's the bug we want verify to catch.
+		assert.ok(!/getText/.test(REGRESSED_HELPER), "fixture sanity: regressed helper has no getText");
+		assert.ok(
+			!/`\$\{[^}]+\}\\n\\n\$\{[^}]+\}`/.test(REGRESSED_HELPER),
+			"fixture sanity: regressed helper has no append concat",
+		);
+
+		const r = smartDequeueSpec.verify(REGRESSED);
+		assert.equal(r.ok, false);
+		if (!r.ok) {
+			assert.ok(
+				r.failures.some((f) => /never reads the current editor text|append branch is missing|destroy typed text/.test(f)),
+				`expected failure mentioning the missing append branch; got: ${r.failures.join("; ")}`,
+			);
+		}
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -456,6 +556,90 @@ describe("applyOne(smart-dequeue)", () => {
 		assert.equal(result.status, "applied", result.message);
 		// File on disk must verify clean against the spec.
 		assert.equal(smartDequeueSpec.verify(readTarget()).ok, true);
+	});
+
+	// BEHAVIORAL: load the PATCHED helper body into a real class and
+	// exercise the user's bug-report scenario end to end. This is the
+	// integration test the previous spec lacked.
+	test("helper preserves typed text on a single slow press (user-reported bug, behavioral)", () => {
+		// Extract popOneQueuedMessageToEditor body from PATCHED_RESTORE_AND_HELPERS
+		// and synthesize a class around it so we can invoke the method.
+		const helperMatch = PATCHED_RESTORE_AND_HELPERS.match(
+			/popOneQueuedMessageToEditor\(options\)\s*\{[\s\S]*?\n    \}/,
+		);
+		assert.ok(helperMatch, "fixture sanity: helper body extractable");
+		const helperSource = helperMatch![0];
+		// Build a minimal class with mocked session/editor and invoke the helper.
+		const factory = new Function(
+			`return class {
+              constructor(session, editor) { this.session = session; this.editor = editor; this.compactionQueuedMessages = []; }
+              ${helperSource}
+            }`,
+		);
+		const Cls = factory();
+		const makeSession = (steerQueue: string[]) => ({
+			_steer: [...steerQueue],
+			_fu: [] as string[],
+			getSteeringMessages() { return [...this._steer]; },
+			getFollowUpMessages() { return [...this._fu]; },
+			clearQueue() { this._steer = []; this._fu = []; },
+			steer(t: string) { this._steer.push(t); },
+			followUp(t: string) { this._fu.push(t); },
+		});
+		const makeEditor = (initial: string) => ({
+			_text: initial,
+			getText() { return this._text; },
+			setText(t: string) { this._text = t; },
+		});
+
+		// Scenario 1: user typed something, then Alt+Up (single slow press,
+		// append flag FALSE). Editor MUST still contain the typed text.
+		{
+			const sess = makeSession(["queued-A"]);
+			const ed = makeEditor("user typed this");
+			const inst = new Cls(sess, ed);
+			const r = inst.popOneQueuedMessageToEditor({ append: false });
+			assert.equal(r.popped, "queued-A");
+			assert.ok(
+				ed._text.includes("user typed this"),
+				`SLOW PRESS BUG: editor lost user-typed text. got: ${JSON.stringify(ed._text)}`,
+			);
+			assert.ok(
+				ed._text.includes("queued-A"),
+				`editor missing popped message. got: ${JSON.stringify(ed._text)}`,
+			);
+			assert.equal(ed._text, "user typed this\n\nqueued-A");
+		}
+
+		// Scenario 2: empty editor, single press. Popped message replaces
+		// the empty content (no destruction since editor was empty).
+		{
+			const sess = makeSession(["queued-B"]);
+			const ed = makeEditor("");
+			const inst = new Cls(sess, ed);
+			inst.popOneQueuedMessageToEditor({ append: false });
+			assert.equal(ed._text, "queued-B");
+		}
+
+		// Scenario 3: rapid press (append=true) with content. Appends.
+		{
+			const sess = makeSession(["queued-C1", "queued-C2"]);
+			const ed = makeEditor("");
+			const inst = new Cls(sess, ed);
+			inst.popOneQueuedMessageToEditor({ append: false });
+			assert.equal(ed._text, "queued-C2"); // LIFO: newest first
+			inst.popOneQueuedMessageToEditor({ append: true });
+			assert.equal(ed._text, "queued-C2\n\nqueued-C1");
+		}
+
+		// Scenario 4: whitespace-only editor counts as empty.
+		{
+			const sess = makeSession(["queued-D"]);
+			const ed = makeEditor("   \n  \n");
+			const inst = new Cls(sess, ed);
+			inst.popOneQueuedMessageToEditor({ append: false });
+			assert.equal(ed._text, "queued-D");
+		}
 	});
 
 	test("dispatches agent (not 'already') when STALE_BULK is in place — upgrade path", async () => {

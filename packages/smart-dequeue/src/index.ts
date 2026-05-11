@@ -7,8 +7,12 @@
  *      until every steer message has.
  *   3. Within each pool: compaction-queued items (newer in practice) come
  *      back before session-queued items.
- *   4. A repeat press within ~500 ms appends the next popped message to
- *      the editor's existing text instead of replacing it.
+ *   4. Non-destructive: if the editor already has content (user typed
+ *      something, or a previous Alt+Up popped an item), the popped
+ *      message is APPENDED after a blank line. Alt+Up never destroys
+ *      what is already in the editor. The ~500 ms rapid-press detector
+ *      is retained as a redundant hint but is no longer load-bearing
+ *      — the helper checks editor content directly.
  *
  * Patched file:
  *   - `interactive-mode.js`
@@ -156,8 +160,10 @@ const NEW_RESTORE = [
 	'            for (const t of compactionSteer) newCompaction.push({ mode: "steer", text: t });',
 	'            for (const t of compactionFollowUp) newCompaction.push({ mode: "followUp", text: t });',
 	"            this.compactionQueuedMessages = newCompaction;",
+	"            // Non-destructive guard: if the editor already has content,",
+	"            // always append after a blank line. Never destroy typed text.",
 	"            const currentText = this.editor.getText();",
-	"            const newText = (append && currentText.trim()) ? `${currentText}\\n\\n${popped}` : popped;",
+	"            const newText = currentText.trim().length > 0 ? `${currentText}\\n\\n${popped}` : popped;",
 	"            this.editor.setText(newText);",
 	'            if (typeof this.updatePendingMessagesDisplay === "function") this.updatePendingMessagesDisplay();',
 	"            const remaining = sessionSteer.length + sessionFollowUp.length + compactionSteer.length + compactionFollowUp.length;",
