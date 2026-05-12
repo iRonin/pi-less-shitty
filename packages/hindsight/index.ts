@@ -18,10 +18,37 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { existsSync, readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { Type } from "@sinclair/typebox";
+import {
+  BACKOFF_SCHEDULE_MS,
+  DEFAULT_MAX_QUEUE_SIZE,
+  enqueue as enqueueQueueEntry,
+  listEntries as listQueueEntries,
+  markAttempted as markQueueAttempted,
+  markAwaitingUser as markQueueAwaitingUser,
+  removeEntry as removeQueueEntry,
+  countAwaitingUser as countQueueAwaitingUser,
+  dueEntries as dueQueueEntries,
+  nextBackoffMs,
+  getQueueDir,
+} from "./queue.ts";
+import type { QueueEntry, QueueOptions } from "./queue.ts";
+import {
+  buildSelfHealEnqueuePayload as _buildSelfHealEnqueuePayload,
+  normalizeBool as _normalizeBool,
+  writeSelfHealEnabledToml as _writeSelfHealEnabledToml,
+} from "./self-heal.ts";
+import type {
+  SelfHealConfig as _SelfHealConfig,
+  RetainContextShape,
+  RetainSnapshotShape,
+} from "./self-heal.ts";
+export const buildSelfHealEnqueuePayload = _buildSelfHealEnqueuePayload;
+export const normalizeBool = _normalizeBool;
+export const writeSelfHealEnabledToml = _writeSelfHealEnabledToml;
 import {
   tokenizeForJaccard,
   jaccardSimilarity,
@@ -84,13 +111,29 @@ interface ResolvedConfig {
   strip_patterns: RegExp[];
 }
 
+/**
+ * Tiny TOML reader. Tracks `[section]` headers and emits sectioned keys as
+ * `${section}_${key}` so the rest of the code can keep reading from a flat
+ * Record<string, string> map. Backwards-compatible: pre-existing root-level
+ * keys (`health_gate`, `recall_retry_attempts`, …) still parse as before.
+ *
+ * Section example:
+ *   [self_heal]
+ *   enabled = true     → out["self_heal_enabled"] = "true"
+ */
 function parseToml(filePath: string): Record<string, string> {
   if (!existsSync(filePath)) return {};
   const raw = readFileSync(filePath, "utf-8");
   const out: Record<string, string> = {};
-  for (const line of raw.split("\n")) {
+  let section = "";
+  for (const rawLine of raw.split("\n")) {
+    const line = rawLine.replace(/\s*#.*$/, ""); // strip trailing comments
+    const hdr = line.match(/^\s*\[([a-zA-Z0-9_]+)\]\s*$/);
+    if (hdr) { section = hdr[1]; continue; }
     const m = line.match(/^\s*([a-zA-Z0-9_]+)\s*=\s*["']?(.*?)["']?\s*$/);
-    if (m) out[m[1]] = m[2];
+    if (!m) continue;
+    const key = section ? `${section}_${m[1]}` : m[1];
+    out[key] = m[2];
   }
   return out;
 }
@@ -384,6 +427,21 @@ export interface RetainSnapshot {
 }
 
 /**
+ * Self-heal G1 — closure-stable payload carried into watchRetainOperation so
+ * the zero-units gate can persist the full retain to disk and the drain can
+ * re-POST without rebuilding from the (already-disposed) agent_end closure.
+ *
+ * Without this, the watcher only sees `transcriptLen` (a number); the actual
+ * transcript text is unreachable by the time Phase D fires (see design doc
+ * §1.2). Threading retainCtx is the load-bearing API change for G1.
+ *
+ * Type aliased to RetainContextShape from ./self-heal.ts so the gate
+ * function (pure, pi-tui-free) and the watcher (in this file) share one
+ * shape definition.
+ */
+export type RetainContext = RetainContextShape;
+
+/**
  * Background task: poll a single retain operation and surface failures.
  * `t0` is `Date.now()` at the moment the retain POST returned HTTP 200.
  *
@@ -400,6 +458,7 @@ async function watchRetainOperation(
   operationId: string,
   t0: number,
   snapshot: RetainSnapshot,
+  retainCtx?: RetainContext,
 ): Promise<void> {
   try {
     const op = await pollOperationUntilTerminal(config.api_url, config.api_key, bank, operationId);
@@ -459,6 +518,17 @@ async function watchRetainOperation(
       try {
         const settings = loadSettings();
         if (settings.healthGate !== "off") markUnhealthy("zero units extracted");
+        // Self-heal G1 — opt-in enqueue. Reads settings FRESH so a mid-session
+        // toggle off via `/hindsight self-heal off` is observed immediately.
+        const payload = buildSelfHealEnqueuePayload(bank, snapshot, settings.selfHeal.enabled, retainCtx);
+        if (payload) {
+          try {
+            const entry = enqueueQueueEntry(payload, {
+              maxQueueSize: settings.selfHeal.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE,
+            });
+            log(`self-heal: enqueued id=${entry.id} bank=${bank} doc=${snapshot.documentId} pre=${snapshot.preUnitsCount}`);
+          } catch (e) { log(`self-heal: enqueue failed ${e}`); }
+        }
       } catch (e) { log(`retain-poll: loadSettings failed ${e}`); }
       pi.sendMessage(
         {
@@ -532,7 +602,238 @@ export const __internal = {
   extractDocumentIds,
   watchRetainOperation,
   buildPreRetainSnapshot,
+  drainQueue,
+  loadAwaitingUserAlertState,
+  saveAwaitingUserAlertState,
 };
+
+// ─── Self-heal G1: drain + alert state ────────────────────────────────────
+//
+// Drain is event-driven (session_start + post-successful-retain). No
+// setInterval — the user mandated this. Per-entry concurrency is bounded at
+// 3 so a deep queue does not block session_start past its existing budget.
+//
+// Awaiting-user alert state persists in ~/.hindsight/self_heal_alert_state.json
+// so the alert fires ONCE per count-change across pi restarts.
+
+const SELF_HEAL_ALERT_STATE_PATH = join(homedir(), ".hindsight", "self_heal_alert_state.json");
+const DRAIN_CONCURRENCY = 3;
+
+export interface AwaitingUserAlertState {
+  lastAlertedCount: number;
+  alertedAt?: string; // ISO
+}
+
+export function loadAwaitingUserAlertState(): AwaitingUserAlertState {
+  try {
+    if (existsSync(SELF_HEAL_ALERT_STATE_PATH)) {
+      const raw = readFileSync(SELF_HEAL_ALERT_STATE_PATH, "utf-8");
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj.lastAlertedCount === "number") return obj as AwaitingUserAlertState;
+    }
+  } catch { /* fall through to default */ }
+  return { lastAlertedCount: 0 };
+}
+
+export function saveAwaitingUserAlertState(s: AwaitingUserAlertState): void {
+  try {
+    mkdirSync(dirname(SELF_HEAL_ALERT_STATE_PATH), { recursive: true });
+    const tmp = `${SELF_HEAL_ALERT_STATE_PATH}.tmp`;
+    writeFileSync(tmp, JSON.stringify(s, null, 2));
+    renameSync(tmp, SELF_HEAL_ALERT_STATE_PATH);
+  } catch (e) { log(`self-heal: alert state write failed ${e}`); }
+}
+
+/**
+ * Self-heal G1 drain. Pure-ish: takes API + bank coords, queue dir override,
+ * and a `pi` + `ctx` for the alert sendMessage. Returns metrics for tests.
+ *
+ * Per entry (in concurrency-bounded parallel):
+ *   1. fetchDocumentUnitsCount(documentId) > preUnitsCount
+ *      → success path: another retain already grew the doc (or this one
+ *        eventually did). Delete entry, count as recovered.
+ *   2. Else: re-POST /memories with the original transcript/tags/context.
+ *      → markAttempted(false, error). nextBackoffMs(attempts) drives next wait.
+ *      When nextBackoffMs returns null → markAwaitingUser(id).
+ *
+ * After the loop, compares countAwaitingUser to the persisted alert state.
+ * If it CHANGED, fire `hindsight-self-heal-awaiting` exactly once.
+ */
+interface DrainResult {
+  drained: number;          // # entries inspected
+  recovered: number;        // # deleted because doc grew
+  reposted: number;         // # entries POSTed (success or fail)
+  failed: number;           // # POST failures
+  newAwaiting: number;      // # newly transitioned to awaiting-user this drain
+  totalAwaiting: number;    // # awaiting-user after drain
+  alertFired: boolean;
+}
+
+async function drainQueue(
+  apiUrl: string,
+  apiKey: string,
+  opts: {
+    pi?: ExtensionAPI;
+    ctx?: any;
+    settings?: HindsightSettings;
+    fetchImpl?: typeof fetch;
+    now?: () => number;
+    queueOptions?: QueueOptions;
+  } = {},
+): Promise<DrainResult> {
+  const result: DrainResult = {
+    drained: 0, recovered: 0, reposted: 0, failed: 0,
+    newAwaiting: 0, totalAwaiting: 0, alertFired: false,
+  };
+  // Gate check — read settings FRESH every call so flipping off mid-session
+  // stops auto-drain immediately.
+  const settings = opts.settings ?? loadSettings();
+  if (!settings.selfHeal.enabled) return result;
+
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const schedule = settings.selfHeal.backoffSchedule ?? BACKOFF_SCHEDULE_MS;
+  const queueOpts: QueueOptions = { ...(opts.queueOptions ?? {}), now: opts.now, schedule };
+
+  const due = dueQueueEntries(queueOpts);
+  result.drained = due.length;
+  if (!due.length) {
+    // Still need to check awaiting-user count for alert state changes — e.g.
+    // a previous session left entries parked; this session's start should
+    // surface the alert if it hasn't been shown yet.
+    result.totalAwaiting = countQueueAwaitingUser(queueOpts);
+    maybeFireAwaitingUserAlert(result, opts.pi, opts.ctx);
+    return result;
+  }
+  log(`self-heal: drain start due=${due.length} concurrency=${DRAIN_CONCURRENCY}`);
+
+  // Bounded concurrency via a simple worker pool.
+  let idx = 0;
+  const workers: Promise<void>[] = [];
+  const drainOne = async (entry: QueueEntry): Promise<void> => {
+    // Re-check settings INSIDE the worker so a mid-drain toggle off stops
+    // outstanding workers from doing further network work.
+    const live = loadSettings();
+    if (!live.selfHeal.enabled) return;
+
+    // Step 1: dedup-by-document-growth. If the document grew vs the
+    // pre-failure snapshot, a successful retain already happened (either
+    // this entry's original op completed late, or a follow-up turn). Delete
+    // without re-POSTing to avoid double-chunking.
+    let postUnits: number | null = null;
+    try {
+      postUnits = await fetchDocumentUnitsCount(apiUrl, apiKey, entry.bank, entry.documentId, fetchImpl);
+    } catch { /* treat as null → fall through to re-POST */ }
+    if (postUnits !== null && postUnits > entry.preUnitsCount) {
+      log(`self-heal: drain id=${entry.id} bank=${entry.bank} recovered (doc grew ${entry.preUnitsCount}→${postUnits})`);
+      markQueueAttempted(entry.id, true, undefined, queueOpts);
+      result.recovered += 1;
+      return;
+    }
+
+    // Step 2: re-POST.
+    let ok = false; let err: string | undefined;
+    try {
+      const res = await fetchImpl(`${apiUrl}/v1/default/banks/${entry.bank}/memories`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeader(apiKey) },
+        body: JSON.stringify({
+          items: [{
+            content: entry.transcript,
+            document_id: entry.documentId,
+            update_mode: "append",
+            context: entry.context,
+            timestamp: new Date().toISOString(),
+            ...(entry.tags?.length ? { tags: entry.tags } : {}),
+          }],
+          async: true,
+        }),
+        signal: AbortSignal.timeout(8000),
+      } as any);
+      ok = res.ok;
+      if (!ok) err = `HTTP ${res.status}`;
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+    }
+    result.reposted += 1;
+    if (ok) {
+      // POST accepted. Treat the entry as still pending the next growth
+      // check (POST 200 just means async work was queued server-side). Mark
+      // as attempted-with-no-growth-yet so the next drain pass will either
+      // see the growth (→ recover) or repost.
+      markQueueAttempted(entry.id, false, "reposted, awaiting outcome", queueOpts);
+    } else {
+      result.failed += 1;
+      markQueueAttempted(entry.id, false, err ?? "unknown", queueOpts);
+    }
+
+    // Budget exhaustion check: if nextBackoffMs(new attempts) returned null,
+    // the markAttempted parked nextRetryAt at MAX_SAFE_INTEGER. Promote to
+    // explicit awaiting-user terminal state so the alert layer can fire.
+    const nextWait = nextBackoffMs(entry.attempts + 1, schedule);
+    if (nextWait === null) {
+      markQueueAwaitingUser(entry.id, queueOpts);
+      result.newAwaiting += 1;
+      log(`self-heal: drain id=${entry.id} bank=${entry.bank} → awaiting-user (attempts=${entry.attempts + 1})`);
+    }
+  };
+
+  // Spin up DRAIN_CONCURRENCY workers, each pulling from `due` until empty.
+  for (let w = 0; w < Math.min(DRAIN_CONCURRENCY, due.length); w++) {
+    workers.push((async () => {
+      while (true) {
+        const my = idx++;
+        if (my >= due.length) return;
+        try { await drainOne(due[my]); } catch (e) { log(`self-heal: worker error ${e}`); }
+      }
+    })());
+  }
+  await Promise.all(workers);
+
+  result.totalAwaiting = countQueueAwaitingUser(queueOpts);
+  maybeFireAwaitingUserAlert(result, opts.pi, opts.ctx);
+  log(`self-heal: drain end drained=${result.drained} recovered=${result.recovered} reposted=${result.reposted} failed=${result.failed} newAwaiting=${result.newAwaiting} totalAwaiting=${result.totalAwaiting}`);
+  return result;
+}
+
+/**
+ * Awaiting-user alert: fire ONCE per count-change. Persists last-alerted
+ * count to disk so subsequent pi sessions don't re-spam.
+ */
+function maybeFireAwaitingUserAlert(result: DrainResult, pi?: ExtensionAPI, ctx?: any): void {
+  const state = loadAwaitingUserAlertState();
+  const current = result.totalAwaiting;
+  if (current === state.lastAlertedCount) return;
+  // Count changed (either up or down). Update state + fire only when count > 0.
+  saveAwaitingUserAlertState({ lastAlertedCount: current, alertedAt: new Date().toISOString() });
+  if (current === 0) {
+    // Awaiting count dropped to zero (user dismissed / drained manually).
+    // Don't spam a recovery alert here — just reset state silently.
+    log(`self-heal: awaiting count cleared (was ${state.lastAlertedCount})`);
+    try { ctx?.ui?.setStatus?.("hindsight", undefined); } catch {}
+    return;
+  }
+  result.alertFired = true;
+  // Compute oldest awaiting-user age (for the user message).
+  const all = listQueueEntries();
+  const oldest = all.filter(e => e.awaitingUser).sort((a, b) => a.createdAt - b.createdAt)[0];
+  const oldestAge = oldest ? Math.max(0, Date.now() - oldest.createdAt) : 0;
+  try { ctx?.ui?.setStatus?.("hindsight", `⚠ Hindsight: ${current} awaiting manual retry`); } catch {}
+  try {
+    pi?.sendMessage?.(
+      {
+        customType: "hindsight-self-heal-awaiting",
+        content: "",
+        display: true,
+        details: { count: current, oldestAgeMs: oldestAge },
+      },
+      { deliverAs: "nextTurn" },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("stale after session replacement or reload")) throw err;
+  }
+  log(`self-heal: alert fired count=${current} oldestAgeMs=${oldestAge}`);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
@@ -581,11 +882,18 @@ export type HealthGate = "off" | "warn" | "block";
 import type { TopicShiftRecallSettings as _TSR } from "./heuristic.ts";
 type TopicShiftRecallSettings = _TSR;
 
+/**
+ * Self-heal G1 — opt-in persistent retry queue for Phase D zero-units failures.
+ * Default: OFF. Toggling on enables enqueue/drain/alert paths.
+ */
+export type SelfHealConfig = _SelfHealConfig;
+
 export interface HindsightSettings {
   healthGate: HealthGate;
   recallRetry: { attempts: number; backoffMs: number };
   recallTimeoutMs: number;
   topicShiftRecall: TopicShiftRecallSettings;
+  selfHeal: SelfHealConfig;
 }
 export type { TopicShiftRecallSettings };
 
@@ -602,6 +910,11 @@ export const DEFAULT_SETTINGS: HindsightSettings = {
     cooldownSeconds: 60,
     everyNTurns: 8,
     jaccardThreshold: 0.2,
+  },
+  selfHeal: {
+    // OFF BY DEFAULT — G1 ships as beta opt-in. Must not change existing
+    // behavior for users who don't explicitly turn it on.
+    enabled: false,
   },
 };
 
@@ -637,6 +950,7 @@ export function buildSettings(
     recallRetry: { ...DEFAULT_SETTINGS.recallRetry },
     recallTimeoutMs: DEFAULT_SETTINGS.recallTimeoutMs,
     topicShiftRecall: { ...DEFAULT_SETTINGS.topicShiftRecall },
+    selfHeal: { ...DEFAULT_SETTINGS.selfHeal },
   };
   if (jsonOverride) {
     if (jsonOverride.healthGate !== undefined) base.healthGate = normalizeHealthGate(jsonOverride.healthGate);
@@ -655,6 +969,11 @@ export function buildSettings(
       if (ts.everyNTurns !== undefined) base.topicShiftRecall.everyNTurns = clampInt(ts.everyNTurns, 1, 1000, base.topicShiftRecall.everyNTurns);
       if (ts.jaccardThreshold !== undefined) base.topicShiftRecall.jaccardThreshold = clampFloat(ts.jaccardThreshold, 0, 1, base.topicShiftRecall.jaccardThreshold);
     }
+    if (jsonOverride.selfHeal) {
+      if (typeof jsonOverride.selfHeal.enabled === "boolean") base.selfHeal.enabled = jsonOverride.selfHeal.enabled;
+      if (Array.isArray(jsonOverride.selfHeal.backoffSchedule)) base.selfHeal.backoffSchedule = [...jsonOverride.selfHeal.backoffSchedule];
+      if (typeof jsonOverride.selfHeal.maxQueueSize === "number") base.selfHeal.maxQueueSize = clampInt(jsonOverride.selfHeal.maxQueueSize, 1, 10_000, DEFAULT_MAX_QUEUE_SIZE);
+    }
   }
   if (tomlOverride) {
     if (tomlOverride.health_gate !== undefined) base.healthGate = normalizeHealthGate(tomlOverride.health_gate);
@@ -667,9 +986,21 @@ export function buildSettings(
     if (tomlOverride.recall_timeout_ms !== undefined) {
       base.recallTimeoutMs = clampInt(tomlOverride.recall_timeout_ms, 500, 60_000, base.recallTimeoutMs);
     }
+    // [self_heal] section — the parseToml emits sectioned keys as `<section>_<key>`.
+    if (tomlOverride.self_heal_enabled !== undefined) {
+      base.selfHeal.enabled = normalizeBool(tomlOverride.self_heal_enabled, base.selfHeal.enabled);
+    }
+    if (tomlOverride.self_heal_max_queue_size !== undefined) {
+      base.selfHeal.maxQueueSize = clampInt(tomlOverride.self_heal_max_queue_size, 1, 10_000, DEFAULT_MAX_QUEUE_SIZE);
+    }
   }
   return base;
 }
+
+// `normalizeBool` and `writeSelfHealEnabledToml` are imported from
+// ./self-heal.ts at the top of this file and re-exported there.
+// Keeping them in a pi-tui-free module lets the integration tests exercise
+// the SAME functions the extension runs without dragging the peer-dep.
 
 function loadSettings(): HindsightSettings {
   let json: Partial<HindsightSettings> | null = null;
@@ -877,6 +1208,18 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     } else {
       log("session_start: no bank_id — extension inactive");
     }
+
+    // ─── Self-heal G1: drain queue (opt-in) ───────────────────────────────
+    // Fire-and-forget after the server + bank probes succeed. Default OFF;
+    // never runs unless settings.selfHeal.enabled is true. Failures are
+    // logged but never propagate.
+    try {
+      const settings = loadSettings();
+      if (settings.selfHeal.enabled) {
+        void drainQueue(config.api_url, config.api_key, { pi, ctx, settings })
+          .catch(e => log(`self-heal: session_start drain error ${e}`));
+      }
+    } catch (e) { log(`self-heal: session_start gate error ${e}`); }
   });
 
   pi.on("session_compact", async () => {
@@ -944,6 +1287,22 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     if (d.reason) t += theme.fg("muted", ` — ${d.reason}`);
     t += "\n" + theme.fg("dim", "  Turn aborted (healthGate=block). Run /hindsight reset after fixing upstream,");
     t += "\n" + theme.fg("dim", "  or set hindsight.healthGate=\"warn\" in ~/.pi/agent/hindsight.json.");
+    return new Text(t, 0, 0);
+  });
+
+  pi.registerMessageRenderer("hindsight-self-heal-awaiting", (msg, _opt, theme) => {
+    const d = (msg.details as any) ?? {};
+    const n = typeof d.count === "number" ? d.count : 0;
+    const ageMs = typeof d.oldestAgeMs === "number" ? d.oldestAgeMs : 0;
+    const ageMin = Math.round(ageMs / 60_000);
+    let t = theme.fg("warning", "⚠ Hindsight self-heal");
+    t += theme.fg("muted", ` — ${n} ${n === 1 ? "entry" : "entries"} awaiting manual retry`);
+    if (ageMin > 0) t += theme.fg("dim", ` (oldest ≈ ${ageMin} min)`);
+    t += "\n" + theme.fg("dim", "  Auto-retry budget exhausted (4 attempts ≈ 7.5 min). Run");
+    t += theme.fg("accent", " /hindsight retry");
+    t += theme.fg("dim", " to drain manually, or");
+    t += theme.fg("accent", " /hindsight queue");
+    t += theme.fg("dim", " to inspect.");
     return new Text(t, 0, 0);
   });
 
@@ -1360,6 +1719,19 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const transcriptLen = transcript.length;
       const preCounts = await buildPreRetainSnapshot(config.api_url, config.api_key, banks, documentId);
 
+      // ─── Self-heal G1: closure-stable RetainContext ───────────────────
+      // Capture transcript + tags + context BEFORE Promise.allSettled so it
+      // is reachable from the fire-and-forget watcher. Without this, the
+      // watcher's scope only has `snapshot.transcriptLen` (a number) and
+      // any zero-units retry would have nothing to re-POST.
+      const retainCtxStable: RetainContext = {
+        transcript,
+        tags,
+        context: `pi | ${localDate} ${localTime} ${tz}`,
+        sessionId,
+        timestamp: new Date().toISOString(),
+      };
+
       const t0 = Date.now();
       const results = await Promise.allSettled(
         banks.map(async (b) => {
@@ -1413,7 +1785,20 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           preUnitsCount: preCounts.get(b) ?? 0,
           transcriptLen,
         };
-        void watchRetainOperation(pi, ctx, config, b, operationId, t0, snapshot);
+        void watchRetainOperation(pi, ctx, config, b, operationId, t0, snapshot, retainCtxStable);
+      }
+
+      // ─── Self-heal G1: opportunistic drain on successful retain ─────────
+      // If selfHeal is on AND at least one bank succeeded this turn, fire a
+      // best-effort drain of the queue. Reads settings FRESH so a /hindsight
+      // self-heal off mid-session takes immediate effect. Fire-and-forget;
+      // failures inside drainQueue are logged but never propagate.
+      if (ok.length) {
+        const liveSettings = loadSettings();
+        if (liveSettings.selfHeal.enabled) {
+          void drainQueue(config.api_url, config.api_key, { pi, ctx, settings: liveSettings })
+            .catch(e => log(`self-heal: agent_end drain error ${e}`));
+        }
       }
 
       // pi.sendMessage can throw "stale after session replacement or reload"
@@ -1446,12 +1831,86 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   // ─── Commands ──────────────────────────────────────────────────────
 
   pi.registerCommand("hindsight", {
-    description: "Hindsight memory status. Usage: /hindsight [status|stats|health|reset|refresh]",
+    description: "Hindsight memory status. Usage: /hindsight [status|stats|health|reset|refresh|retry|queue|self-heal on|off]",
     handler: async (args: any, ctx) => {
       const config = resolveConfig(process.cwd());
       if (!config) { ctx.ui.notify("Hindsight not configured — no .hindsight/config.toml in path.", "warning"); return; }
 
       const sub = typeof args === "string" ? args.trim() : "";
+
+      // ─── Self-heal G1 subcommands ─────────────────────────────────────
+      if (sub === "retry") {
+        const settings = loadSettings();
+        if (!settings.selfHeal.enabled) {
+          ctx.ui.notify("Self-heal is OFF. Run `/hindsight self-heal on` first.", "warning");
+          return;
+        }
+        const r = await drainQueue(config.api_url, config.api_key, { pi, ctx, settings });
+        ctx.ui.notify(
+          `Self-heal drain:\n` +
+          `  drained: ${r.drained}\n` +
+          `  recovered: ${r.recovered}\n` +
+          `  reposted: ${r.reposted} (${r.failed} failed)\n` +
+          `  newly awaiting-user: ${r.newAwaiting}\n` +
+          `  total awaiting-user: ${r.totalAwaiting}`,
+          "info",
+        );
+        return;
+      }
+
+      if (sub === "queue") {
+        const all = listQueueEntries();
+        if (!all.length) { ctx.ui.notify("Hindsight queue is empty.", "info"); return; }
+        const lines = [`Hindsight queue (${all.length} entries):`];
+        const now = Date.now();
+        for (const e of all) {
+          const ageMin = Math.round((now - e.createdAt) / 60_000);
+          const due = e.awaitingUser
+            ? "awaiting-user"
+            : (e.nextRetryAt <= now ? "due" : `in ${Math.max(0, Math.round((e.nextRetryAt - now) / 1000))}s`);
+          lines.push(`  ${e.id.slice(0, 8)} bank=${e.bank} doc=${e.documentId.slice(0, 24)} attempts=${e.attempts}/${BACKOFF_SCHEDULE_MS.length} age=${ageMin}m next=${due}${e.lastError ? ` err="${e.lastError.slice(0, 60)}"` : ""}`);
+        }
+        lines.push("");
+        lines.push(`Queue dir: ${getQueueDir()}`);
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+
+      if (sub === "self-heal" || sub === "selfheal" || sub.startsWith("self-heal ") || sub.startsWith("selfheal ")) {
+        const parts = sub.split(/\s+/);
+        const action = (parts[1] || "").toLowerCase();
+        const cfgPath = join(homedir(), ".hindsight", "config.toml");
+        if (action === "on" || action === "off") {
+          const enabled = action === "on";
+          try {
+            writeSelfHealEnabledToml(cfgPath, enabled);
+            // Reset alert state on toggle so the next drain reports cleanly.
+            saveAwaitingUserAlertState({ lastAlertedCount: 0 });
+            ctx.ui.notify(
+              `Self-heal ${enabled ? "ENABLED" : "DISABLED"} (persisted to ${cfgPath}).\n` +
+              (enabled ? "  - Zero-units retains will be enqueued for retry.\n  - Bounded backoff: 30s, 60s, 2min, 4min → alert.\n  - Drain runs on session_start and after successful retains." : "  - Auto-retry stopped immediately. Existing queue entries are not deleted."),
+              "info",
+            );
+          } catch (e) {
+            ctx.ui.notify(`Failed to write ${cfgPath}: ${e}`, "error");
+          }
+          return;
+        }
+        // Status display
+        const s = loadSettings();
+        const all = listQueueEntries();
+        const awaiting = all.filter(e => e.awaitingUser).length;
+        ctx.ui.notify(
+          `Self-heal status:\n` +
+          `  enabled: ${s.selfHeal.enabled}\n` +
+          `  queue:   ${all.length} entries (${awaiting} awaiting-user)\n` +
+          `  backoff: [${(s.selfHeal.backoffSchedule ?? BACKOFF_SCHEDULE_MS).join(", ")}] ms\n` +
+          `  max:     ${s.selfHeal.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE}\n` +
+          `\nToggle: /hindsight self-heal on | off`,
+          "info",
+        );
+        return;
+      }
 
       if (sub === "reset") {
         const wasHealthy = healthState.healthy;

@@ -149,6 +149,97 @@ recall_retry_backoff_ms = "1000"
 recall_timeout_ms = "5000"
 ```
 
+## Self-heal (opt-in, beta)
+
+Phase G1 — persistent retry queue for the Phase D "substantial input → 0 facts extracted"
+failure mode (covered in `docs/SELF_HEAL_DESIGN.md`). When the extraction LLM is temporarily
+down (kilocode `limit_burst_rate`, container OOM, network blip), the turn's transcript is
+otherwise lost the moment Phase D fires. Self-heal persists the failed retain to disk and
+re-POSTs it on the next pi session.
+
+**OFF by default.** Existing installs see no change unless this is explicitly turned on.
+
+### Enable
+
+Either persistent (TOML):
+
+```toml
+# ~/.hindsight/config.toml
+[self_heal]
+enabled = true
+```
+
+Or runtime toggle (updates the TOML in place):
+
+```
+/hindsight self-heal on
+/hindsight self-heal off
+```
+
+The setting is read FRESH at every gate (enqueue / drain / alert), so flipping off mid-session
+stops auto-retry immediately. Existing queue entries are not deleted on toggle off — they stay
+for manual `/hindsight retry`.
+
+### Bounded backoff (user-mandated)
+
+The original design doc proposed an exponential `[60s, 5min, 30min, 2h, 12h]` schedule. That
+was rejected: silent 12h sleeps are unacceptable. Self-heal uses:
+
+```
+[30s, 60s, 2min, 4min]   → total ≈ 7.5 min of auto-retry
+                          then alert + stop
+```
+
+After the 4th failed attempt, the entry is marked `awaiting-user` and a single
+high-visibility alert fires:
+
+- Status bar: `⚠ Hindsight: <N> awaiting manual retry`
+- Chat message: `hindsight-self-heal-awaiting` (rendered prominently in `nextTurn`)
+
+The alert fires ONCE per count change — it does not re-spam on every subsequent session.
+State persisted at `~/.hindsight/self_heal_alert_state.json`.
+
+### Drain triggers
+
+Drains are event-driven (no `setInterval`):
+
+1. `session_start` — best-shot retry on every new pi session.
+2. After a successful `agent_end` retain — opportunistic, fire-and-forget.
+3. `/hindsight retry` — explicit manual drain.
+
+Concurrency capped at 3. Per-entry dedup-by-document-growth: if the document's
+`memory_unit_count` has grown vs the captured `preUnitsCount` snapshot, the entry is dropped
+without re-POST (another retain succeeded externally).
+
+### Queue inspection
+
+```
+/hindsight queue           # list pending entries (id, bank, age, attempts, lastError)
+/hindsight self-heal       # status: enabled flag + queue summary
+```
+
+On-disk layout:
+
+- `~/.hindsight/queue/<uuid>.json` — one entry per failed retain
+- `~/.hindsight/queue/<uuid>.json.tmp` — atomic-write scratch (ignored by `listEntries`)
+- `~/.hindsight/self_heal_alert_state.json` — last-alerted awaiting-user count
+
+Manual cleanup:
+
+```bash
+rm ~/.hindsight/queue/<id>.json     # drop a single entry
+rm -rf ~/.hindsight/queue/          # nuke the whole queue
+```
+
+### What G1 does NOT do
+
+- No mid-session timer-based drain (would be G2).
+- No extraction-LLM-health probe before drain (would be G3 — needs upstream PR).
+- No automatic token refresh (would be G4 — separate).
+
+If a queue entry hits awaiting-user, the user is expected to (a) fix the upstream issue
+(restart hindsight, refresh the kilocode token, swap LLM mode), then (b) run `/hindsight retry`.
+
 ## Opt-out
 
 | Tag | Effect |
