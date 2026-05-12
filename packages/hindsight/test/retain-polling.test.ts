@@ -634,3 +634,111 @@ describe("retain-polling: source-level regression — snapshot locals in scope",
       "preCounts must be defined in agent_end scope before snapshot construction");
   });
 });
+
+// ---------------------------------------------------------------------------
+// TESTS — Phase D watcher dispatch order vs pi.sendMessage (pi -p mode fix).
+//
+// Bug: in `pi -p` single-shot mode the runtime disposes ctx before the
+// queued agent_end handler runs, so `pi.sendMessage(...)` throws a
+// "stale after session replacement or reload" error. The original handler
+// called pi.sendMessage BEFORE the `for (... watchRetainOperation(...))`
+// loop, so the throw aborted the surrounding try-block and Phase D
+// silent-failure detection never fired in print mode.
+//
+// Two invariants pin the fix:
+//
+//   (a) Source-level: the watcher dispatch loop must appear BEFORE every
+//       pi.sendMessage call in the agent_end handler. This is the actual
+//       fix — ordering is the contract.
+//
+//   (b) Source-level: each pi.sendMessage call in the agent_end handler
+//       must be wrapped in try/catch that swallows the
+//       "stale after session replacement or reload" string (matches the
+//       session-title fix in commit 971552b). Belt-and-braces defense
+//       against the same race surfacing through a different code path.
+//
+// Together (a) and (b) make the bug structurally impossible to re-introduce:
+// a refactor that calls sendMessage before the dispatch loop would fail (a);
+// a refactor that drops the stale-ctx try/catch would fail (b).
+//
+// A behavioral test (mock pi.sendMessage to throw, observe the poll fetch)
+// is intentionally NOT included here — index.ts runtime-imports
+// `@earendil-works/pi-tui` and this package's test harness has no installed
+// peer deps (the same reason every other test in this file uses a local
+// mirror of the production helpers). The source-level invariants above
+// encode the same contract more robustly than a timer/fetch behavioral
+// mock that would otherwise be required.
+// ---------------------------------------------------------------------------
+
+describe("retain-polling: dispatch order survives pi.sendMessage throw", () => {
+  test("(a) source-level — watchRetainOperation dispatch loop appears before pi.sendMessage in agent_end handler", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(join(here, "..", "index.ts"), "utf-8");
+
+    // Slice the agent_end handler body. Start at the `pi.on("agent_end"`
+    // anchor, end at the next top-level `pi.registerCommand(` ("// ───
+    // Commands" section). This is robust against renames within the
+    // handler body itself.
+    const handlerStart = src.indexOf("pi.on(\"agent_end\"");
+    assert.ok(handlerStart > 0, "agent_end handler not found in index.ts");
+    const handlerEnd = src.indexOf("pi.registerCommand(", handlerStart);
+    assert.ok(handlerEnd > handlerStart, "agent_end handler end marker not found");
+    const body = src.slice(handlerStart, handlerEnd);
+
+    const dispatchIdx = body.indexOf("watchRetainOperation(pi");
+    assert.ok(
+      dispatchIdx > 0,
+      "watchRetainOperation(pi, ...) dispatch site not found inside agent_end handler",
+    );
+
+    // Every pi.sendMessage call inside the handler must occur AFTER the
+    // dispatch site. Walk every match.
+    const sendRe = /pi\.sendMessage\s*\(/g;
+    let m: RegExpExecArray | null;
+    let sendCount = 0;
+    while ((m = sendRe.exec(body)) !== null) {
+      sendCount++;
+      assert.ok(
+        m.index > dispatchIdx,
+        `pi.sendMessage at body offset ${m.index} appears BEFORE watchRetainOperation dispatch at offset ${dispatchIdx} — print-mode regression: stale-ctx throw will abort dispatch loop`,
+      );
+    }
+    assert.ok(sendCount >= 2, `expected ≥ 2 pi.sendMessage calls in agent_end (success + failure paths), got ${sendCount}`);
+  });
+
+  test("(b) source-level — each pi.sendMessage in agent_end is wrapped in try/catch that swallows stale-ctx error", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(join(here, "..", "index.ts"), "utf-8");
+
+    const handlerStart = src.indexOf("pi.on(\"agent_end\"");
+    const handlerEnd = src.indexOf("pi.registerCommand(", handlerStart);
+    const body = src.slice(handlerStart, handlerEnd);
+
+    // For each pi.sendMessage call inside agent_end, look backward for the
+    // enclosing `try {` within a small window and forward for the matching
+    // `catch (` that mentions the stale-ctx string. We don't need a full
+    // AST — a coarse proximity check is enough to pin the invariant.
+    const sendRe = /pi\.sendMessage\s*\(/g;
+    let m: RegExpExecArray | null;
+    const offsets: number[] = [];
+    while ((m = sendRe.exec(body)) !== null) offsets.push(m.index);
+
+    assert.ok(offsets.length >= 2, "expected at least 2 pi.sendMessage calls");
+
+    for (const off of offsets) {
+      // Look ~400 chars before for the nearest `try {`
+      const before = body.slice(Math.max(0, off - 400), off);
+      const tryIdx = before.lastIndexOf("try {");
+      assert.ok(tryIdx >= 0, `pi.sendMessage at offset ${off} not preceded by a nearby try { — stale-ctx error will propagate`);
+
+      // Look ~600 chars after for the catch block that swallows stale-ctx
+      const after = body.slice(off, off + 600);
+      assert.match(
+        after,
+        /catch\s*\([^)]*\)\s*\{[\s\S]*?stale after session replacement or reload/,
+        `pi.sendMessage at offset ${off} not followed by a catch that mentions "stale after session replacement or reload" — race fix missing for this call site`,
+      );
+    }
+  });
+
+});

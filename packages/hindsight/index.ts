@@ -1396,17 +1396,13 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const ok = fulfilled.map(v => v.bank);
       hookStats.retain = { firedAt: new Date().toISOString(), result: ok.length ? "ok" : "failed", detail: ok.join(", ") };
 
-      if (ok.length) {
-        const transcriptPreview = transcript.length > 1000 ? transcript.slice(0, 1000) + "…" : transcript;
-        pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: ok, transcript: transcriptPreview } }, { deliverAs: "nextTurn" });
-      } else {
-        ctx.ui.setStatus("hindsight", "⚠ retain failed");
-        pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
-      }
-
       // ─── Phase D: background polling for silent failures ─────────────
-      // No await — these promises run after agent_end returns. Each watcher
-      // gets the per-bank pre-retain snapshot so it can compute a real delta.
+      // Dispatched BEFORE pi.sendMessage so a stale-ctx throw from sendMessage
+      // (notably in `pi -p` single-shot mode, where the runtime invalidates
+      // ctx by the time the queued agent_end handler runs) cannot abort the
+      // dispatch. `void watchRetainOperation(...)` is fire-and-forget — each
+      // watcher gets the per-bank pre-retain snapshot so it can compute a
+      // real delta after the operation completes.
       for (const { bank: b, operationId } of fulfilled) {
         if (!operationId) {
           log(`retain: bank=${b} no operation_id in response — skipping watcher`);
@@ -1418,6 +1414,29 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           transcriptLen,
         };
         void watchRetainOperation(pi, ctx, config, b, operationId, t0, snapshot);
+      }
+
+      // pi.sendMessage can throw "stale after session replacement or reload"
+      // when the runtime invalidates ctx after disposeRuntime() (same race as
+      // commit 971552b for session-title). Swallow exactly that error; rethrow
+      // anything else so real bugs surface. Wrapped per-call so a throw from
+      // the success path does not skip the failure path or vice versa.
+      if (ok.length) {
+        const transcriptPreview = transcript.length > 1000 ? transcript.slice(0, 1000) + "…" : transcript;
+        try {
+          pi.sendMessage({ customType: "hindsight-retain", content: "", display: true, details: { banks: ok, transcript: transcriptPreview } }, { deliverAs: "nextTurn" });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes("stale after session replacement or reload")) throw err;
+        }
+      } else {
+        try { ctx.ui.setStatus("hindsight", "⚠ retain failed"); } catch {}
+        try {
+          pi.sendMessage({ customType: "hindsight-retain-failed", content: "", display: true }, { deliverAs: "nextTurn" });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes("stale after session replacement or reload")) throw err;
+        }
       }
     } catch (e) {
       log(`retain: error ${e}`);
