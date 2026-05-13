@@ -18,6 +18,11 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import {
+  bumpConsecutiveZero,
+  resetConsecutiveZero,
+  renderZeroUnitsMessage,
+} from "./zero-units-render.ts";
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -624,7 +629,8 @@ async function watchRetainOperation(
       //               (rare but the only structural signal we have for an
       //               unhealthy LLM at the zero-units detection point).
       const legitEmpty = !op.error_message;
-      log(`retain-poll: zero-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen} legit_empty=${legitEmpty}`);
+      const streak = bumpConsecutiveZero(bank);
+      log(`retain-poll: zero-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen} legit_empty=${legitEmpty} streak=${streak}`);
       try { ctx.ui.setStatus?.("hindsight", legitEmpty ? "ℹ 0 facts extracted" : "⚠ 0 units extracted"); } catch {}
       try {
         const settings = loadSettings();
@@ -644,6 +650,14 @@ async function watchRetainOperation(
           } catch (e) { log(`self-heal: enqueue failed ${e}`); }
         }
       } catch (e) { log(`retain-poll: loadSettings failed ${e}`); }
+      // Cap transcript carried in details so a megabyte-scale retain does not
+      // bloat the message store. 50K matches the existing transcript-cap used
+      // by the retain renderer; the head/expanded display still works.
+      const TRANSCRIPT_DETAILS_CAP = 50_000;
+      const transcriptText = retainCtx?.transcript ?? "";
+      const transcriptCapped = transcriptText.length > TRANSCRIPT_DETAILS_CAP
+        ? transcriptText.slice(0, TRANSCRIPT_DETAILS_CAP) + "…"
+        : transcriptText;
       pi.sendMessage(
         {
           customType: "hindsight-retain-zero-units-extracted",
@@ -657,8 +671,11 @@ async function watchRetainOperation(
             pre_units_count: snapshot.preUnitsCount,
             post_units_count: postUnits,
             transcript_len: snapshot.transcriptLen,
+            transcript: transcriptCapped,
             error_message: op.error_message ?? null,
             legit_empty: legitEmpty,
+            api_url: config.api_url,
+            consecutive_zero_streak: streak,
           },
         },
         { deliverAs: "nextTurn" },
@@ -673,6 +690,10 @@ async function watchRetainOperation(
     }
 
     log(`retain-poll: ok op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} delta=${delta}`);
+    // Real success heals the consecutive-zero streak for this bank. Counter
+    // resets ONLY when units were actually added (delta > 0). Symmetric with
+    // markHealthy() below.
+    resetConsecutiveZero(bank);
     // Change 1b: real success (postUnits > preUnits) heals unhealthy state.
     // Covers the async-completion path where the POST returned 200 but units
     // only appeared after the watcher polled — the synchronous markHealthy()
@@ -1189,6 +1210,22 @@ export function getHealthState(): Readonly<HealthState> {
   return healthState;
 }
 
+// ─── Zero-units render helpers + per-bank consecutive-zero streak ───────────
+// Implementation lives in zero-units-render.ts (no pi-tui peer-dep) so the
+// unit tests can exercise the helpers without instantiating the runtime.
+export {
+  bumpConsecutiveZero,
+  resetConsecutiveZero,
+  getConsecutiveZero,
+  __getConsecutiveZeroMapForTests,
+  durationBucketLabel,
+  TRANSCRIPT_HEAD_MAX,
+  transcriptHead,
+  streakOrdinal,
+  buildInspectCurl,
+  renderZeroUnitsMessage,
+} from "./zero-units-render.ts";
+
 // Module-level rate-limit timestamp for the passive health re-probe (Change 2).
 // Reset on session_start so a fresh pi process re-probes immediately if it
 // inherits an unhealthy mark via a stale config-derived assumption (it can't
@@ -1370,6 +1407,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     markHealthy();
     lastHealthProbeAt = 0;
     resetRecallState();
+    // Per-bank consecutive-zero counter is fresh-per-session. A stale streak
+    // from a previous session would mis-render the first 0-unit retain as Nth.
+    resetConsecutiveZero();
     hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
     hookStats.recall = {};
     hookStats.retain = {};
@@ -1458,30 +1498,9 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     return new Text(t, 0, 0);
   });
 
-  pi.registerMessageRenderer("hindsight-retain-zero-units-extracted", (msg, _opt, theme) => {
+  pi.registerMessageRenderer("hindsight-retain-zero-units-extracted", (msg, opt, theme) => {
     const d = (msg.details as any) ?? {};
-    // legit_empty true  → LLM responded normally with 0 facts. Informational.
-    // legit_empty false → operation surfaced error_message → likely LLM-down.
-    const legitEmpty = d.legit_empty === true;
-    // theme.fg color choice: pi-tui's ThemeColor enum has no "info" entry, so
-    // we use "accent" — the canonical neutral highlight color used elsewhere
-    // in this renderer (e.g. /hindsight retry callouts) — to visually distinguish
-    // legit-empty (informational) from real-down (warning).
-    let t = legitEmpty
-      ? theme.fg("accent", "ℹ Hindsight") + theme.fg("muted", ": 0 facts extracted")
-      : theme.fg("warning", "⚠ Hindsight") + theme.fg("muted", " retain completed but added 0 units");
-    if (d.bank) t += theme.fg("dim", ` → ${d.bank}`);
-    if (typeof d.op_age_ms === "number") t += theme.fg("dim", ` (${Math.round(d.op_age_ms / 1000)}s)`);
-    if (typeof d.transcript_len === "number") t += theme.fg("dim", ` [${d.transcript_len} chars in]`);
-    if (legitEmpty) {
-      t += "\n" + theme.fg("dim", "  LLM responded normally — content may simply lack extractable claims.");
-      t += "\n" + theme.fg("dim", "  No action needed unless this persists across substantive retains.");
-    } else {
-      t += "\n" + theme.fg("dim", "  Substantial input + LLM error → extraction LLM may be unhealthy.");
-      t += "\n" + theme.fg("dim", "  Check `docker logs hindsight --tail 50` and `~/Work/llm-mode.sh status`.");
-      if (d.error_message) t += "\n" + theme.fg("dim", `  ${String(d.error_message).slice(0, 300)}`);
-    }
-    return new Text(t, 0, 0);
+    return new Text(renderZeroUnitsMessage(d, !!opt?.expanded, theme), 0, 0);
   });
 
   pi.registerMessageRenderer("hindsight-blocked", (msg, _opt, theme) => {
@@ -2158,6 +2177,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         const prevReason = healthState.reason;
         markHealthy();
         resetRecallState();
+        resetConsecutiveZero();
         ctx.ui.setStatus?.("hindsight", `🧠 ${getActiveBank(config) || ""}`.trim() || undefined);
         ctx.ui.notify(
           wasHealthy
