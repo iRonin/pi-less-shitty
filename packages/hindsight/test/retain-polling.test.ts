@@ -835,8 +835,14 @@ describe("retain-polling: source-level regression — snapshot locals in scope",
     assert.ok(handlerIdx > 0, "agent_end handler not found before snapshot site");
 
     const scope = src.slice(handlerIdx, snapshotIdx);
-    assert.match(scope, /const\s+documentId\s*=/,
-      "documentId must be defined in agent_end scope before snapshot construction");
+    // Document rollover (May 2026) split the single `documentId` local into
+    // a per-bank map (`docIdByBank`) + fallback (`baseDocumentId`). Either
+    // shape must be present before the snapshot construction site so the
+    // snapshot's `documentId` field can resolve.
+    assert.match(scope, /const\s+(documentId|baseDocumentId)\s*=/,
+      "baseDocumentId (or legacy documentId) must be defined in agent_end scope before snapshot construction");
+    assert.match(scope, /const\s+docIdByBank\s*=|const\s+documentId\s*=/,
+      "docIdByBank (rollover) or legacy documentId must be populated before snapshot construction");
     assert.match(scope, /const\s+transcriptLen\s*=/,
       "transcriptLen must be defined in agent_end scope before snapshot construction");
     assert.match(scope, /const\s+preCounts\s*=/,

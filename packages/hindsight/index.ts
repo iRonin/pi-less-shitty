@@ -390,6 +390,101 @@ async function fetchDocumentUnitsCount(
 }
 
 /**
+ * Fetch the byte/char length of an existing document's `original_text`, or
+ * `null` if the document does not exist yet (404) or the request failed.
+ *
+ * Used by `resolveSessionDocumentId` to decide whether to keep appending to
+ * `session-<id>` or roll over to `session-<id>-<part>`. The server may
+ * advertise the length directly via a `text_length` field; otherwise we fall
+ * back to measuring `original_text.length` so this still works against older
+ * hindsight builds.
+ *
+ * Note: in the fallback branch we download the full document body, which can
+ * be ~500K chars for bloated sessions. That's an acceptable one-off per
+ * retain because (a) it only fires when the live doc is already near the
+ * rollover threshold, and (b) once we've rolled over, subsequent retains
+ * probe the smaller part doc first and short-circuit on its lower length.
+ */
+async function fetchDocumentTextLength(
+  apiUrl: string,
+  apiKey: string,
+  bank: string,
+  documentId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<number | null> {
+  try {
+    const res = await fetchImpl(
+      `${apiUrl}/v1/default/banks/${bank}/documents/${documentId}`,
+      { headers: authHeader(apiKey), signal: AbortSignal.timeout(5000) } as any,
+    );
+    if (res.status === 404) return null;
+    if (!res.ok) return null;
+    const data = (await res.json()) as { text_length?: number; original_text?: string };
+    if (typeof data.text_length === "number") return data.text_length;
+    if (typeof data.original_text === "string") return data.original_text.length;
+    return 0;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Document rollover — cap individual session documents at ~80K chars so the
+ * extraction LLM (gpt-oss-120b on Cerebras, 131K-token / ≈525K-char context)
+ * never sees a doc large enough to overflow its window during retain.
+ *
+ * Observed in the wild before the cap: documents grew to 500K+ chars and
+ * silently dropped to 0 extracted units (legal-ramod 544K / 0 units,
+ * legal-mosquito 528K, project-Pi-Agent 443K). 80K is the conservative
+ * default; tune via `HINDSIGHT_DOC_ROLLOVER_CHARS` env var.
+ */
+export const DEFAULT_DOC_ROLLOVER_CHARS = 80_000;
+export function getDocRolloverThreshold(): number {
+  const v = parseInt(process.env.HINDSIGHT_DOC_ROLLOVER_CHARS || "", 10);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_DOC_ROLLOVER_CHARS;
+}
+
+/**
+ * Sanity cap on the number of parts we'll probe for a single session.
+ * Each part holds up to threshold chars (80K default); 50 parts → 4 MB of
+ * raw transcript per session, which is multiple full work-days of pi usage.
+ * Beyond this we stop probing and append to the last part rather than
+ * spinning forever.
+ */
+export const MAX_DOC_ROLLOVER_PARTS = 50;
+
+/**
+ * Resolve the right document_id for THIS retain against `bank`.
+ *
+ * Walks `session-<id>`, `session-<id>-2`, `…`, `session-<id>-N` and returns
+ * the first part that either (a) does not exist yet (use it fresh) or
+ * (b) is below `threshold` chars (append). If all `MAX_DOC_ROLLOVER_PARTS`
+ * are full, returns the last part as a last-resort append target rather
+ * than throwing — a still-functioning retain beats a hard failure.
+ *
+ * Network cost: at most one GET per probed part; we early-exit on the
+ * first hit, so in steady state this is one round-trip.
+ */
+export async function resolveSessionDocumentId(
+  apiUrl: string,
+  apiKey: string,
+  bank: string,
+  sessionId: string,
+  threshold: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  const baseId = `session-${sessionId}`;
+  for (let part = 1; part <= MAX_DOC_ROLLOVER_PARTS; part++) {
+    const id = part === 1 ? baseId : `${baseId}-${part}`;
+    const length = await fetchDocumentTextLength(apiUrl, apiKey, bank, id, fetchImpl);
+    if (length === null) return id;       // 404 — part doesn't exist yet, use it
+    if (length < threshold) return id;    // existing doc has room — append
+    // otherwise continue probing the next part
+  }
+  return `${baseId}-${MAX_DOC_ROLLOVER_PARTS}`;
+}
+
+/**
  * Extract document_ids from a completed retain operation's `result_metadata`.
  * The value is consistently written by hindsight at completion (verified
  * against vectorize-io/hindsight:latest), unlike `unit_ids_count`.
@@ -626,6 +721,7 @@ async function buildPreRetainSnapshot(
 // Export internals for unit testing without recreating them in test files.
 export const __internal = {
   fetchDocumentUnitsCount,
+  fetchDocumentTextLength,
   extractDocumentIds,
   watchRetainOperation,
   buildPreRetainSnapshot,
@@ -1822,9 +1918,38 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       // completes. Without this, the watcher fires with preUnitsCount=0
       // for every bank and zero-units detection silently misclassifies
       // append-mode retains (which already had units) as failures.
-      const documentId = `session-${sessionId}`;
+      // ─── Document rollover: pick per-bank document_id ─────────────────
+      // Each bank gets its own rollover state because their docs grow at
+      // different rates (project bank vs global bank vs legal bank etc.).
+      // The resolver probes session-<id>, session-<id>-2, … and returns
+      // the first part below the threshold (or 404, meaning fresh). On
+      // resolver error we fall back to the legacy `session-<id>` so a
+      // hindsight-server hiccup never blocks the retain.
+      const baseDocumentId = `session-${sessionId}`;
       const transcriptLen = transcript.length;
-      const preCounts = await buildPreRetainSnapshot(config.api_url, config.api_key, banks, documentId);
+      const rolloverThreshold = getDocRolloverThreshold();
+      const docIdByBank = new Map<string, string>();
+      await Promise.all(banks.map(async (b) => {
+        try {
+          const id = await resolveSessionDocumentId(
+            config.api_url, config.api_key, b, sessionId, rolloverThreshold,
+          );
+          docIdByBank.set(b, id);
+        } catch {
+          docIdByBank.set(b, baseDocumentId);
+        }
+      }));
+
+      // Pre-retain snapshot must use the resolved (per-bank) doc id so the
+      // watcher's post-retain delta compares apples to apples. Inlined here
+      // because buildPreRetainSnapshot() assumes a single document_id
+      // across banks, which no longer holds after rollover.
+      const preCounts = new Map<string, number>();
+      await Promise.all(banks.map(async (b) => {
+        const docId = docIdByBank.get(b) || baseDocumentId;
+        const n = await fetchDocumentUnitsCount(config.api_url, config.api_key, b, docId);
+        preCounts.set(b, n ?? 0);
+      }));
 
       // ─── Self-heal G1: closure-stable RetainContext ───────────────────
       // Capture transcript + tags + context BEFORE Promise.allSettled so it
@@ -1842,13 +1967,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
       const t0 = Date.now();
       const results = await Promise.allSettled(
         banks.map(async (b) => {
+          const docId = docIdByBank.get(b) || baseDocumentId;
           const res = await fetch(`${config.api_url}/v1/default/banks/${b}/memories`, {
             method: "POST",
             headers: { "Content-Type": "application/json", ...authHeader(config.api_key) },
             body: JSON.stringify({
               items: [{
                 content: transcript,
-                document_id: documentId,
+                document_id: docId,
                 update_mode: "append",
                 context: `pi | ${localDate} ${localTime} ${tz}`,
                 timestamp: new Date().toISOString(),
@@ -1896,7 +2022,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           continue;
         }
         const snapshot: RetainSnapshot = {
-          documentId,
+          documentId: docIdByBank.get(b) || baseDocumentId,
           preUnitsCount: preCounts.get(b) ?? 0,
           transcriptLen,
         };
@@ -2145,13 +2271,46 @@ export default function hindsightExtension(pi: ExtensionAPI) {
   });
 }
 
-function getLastUserMessage(ctx: any, fallback: string): string {
+/**
+ * Extract the most recent user-message text from the session.
+ *
+ * pi messages may have either a plain string content or a content-block
+ * array (text/image/tool_use/tool_result). The previous implementation
+ * fell back to `JSON.stringify(content)` on arrays — which polluted retain
+ * transcripts with the raw block JSON (incl. base64 images, tool-use IDs,
+ * etc.) and was the root cause of multi-hundred-K documents in the
+ * hindsight store that subsequently overflowed the extraction LLM context.
+ *
+ * Behavior:
+ *   - string content → returned as-is
+ *   - block array → concatenation of `type === "text"` blocks (newline-joined)
+ *     with everything else (images, tool_use, tool_result) silently dropped
+ *   - unknown/empty shape → "" (NOT JSON.stringify — empty is strictly better)
+ *   - no user message found → `fallback`
+ */
+export function getLastUserMessage(ctx: any, fallback: string): string {
   try {
     const entries = ctx.sessionManager?.getEntries() || [];
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i];
-      if (e.type === "message" && e.message?.role === "user") {
-        return typeof e.message.content === "string" ? e.message.content : JSON.stringify(e.message.content);
+      if (e?.type === "message" && e.message?.role === "user") {
+        const content = e.message.content;
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) {
+          const text = content
+            .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+            .map((b: any) => b.text)
+            .join("\n");
+          if (text) return text;
+          // Empty text join (e.g. all-image content) → fall through to "".
+          // "" is preferable to the legacy JSON dump because retain-time
+          // callers treat empty as "no extractable user text" and skip
+          // pollution-prone branches, whereas a JSON dump would survive
+          // into the document store.
+          return "";
+        }
+        // Unknown content shape (null, number, object) — same rationale.
+        return "";
       }
     }
   } catch {}
