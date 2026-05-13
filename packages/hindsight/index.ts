@@ -578,6 +578,12 @@ async function watchRetainOperation(
     }
 
     log(`retain-poll: ok op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} delta=${delta}`);
+    // Change 1b: real success (postUnits > preUnits) heals unhealthy state.
+    // Covers the async-completion path where the POST returned 200 but units
+    // only appeared after the watcher polled — the synchronous markHealthy()
+    // in agent_end already fires on POST, but if a prior turn poisoned the
+    // flag between the POST and this watcher resolving, we re-clear it here.
+    markHealthy();
   } catch (e) {
     log(`retain-poll: watcher error op=${operationId} bank=${bank} ${e}`);
   }
@@ -1087,6 +1093,55 @@ export function getHealthState(): Readonly<HealthState> {
   return healthState;
 }
 
+// Module-level rate-limit timestamp for the passive health re-probe (Change 2).
+// Reset on session_start so a fresh pi process re-probes immediately if it
+// inherits an unhealthy mark via a stale config-derived assumption (it can't
+// today — healthState is module-scoped — but keeping reset symmetric with
+// resetRecallState() is cheap and future-proof).
+let lastHealthProbeAt = 0;
+export function __resetLastHealthProbeAtForTests(): void { lastHealthProbeAt = 0; }
+export function __getLastHealthProbeAtForTests(): number { return lastHealthProbeAt; }
+
+/**
+ * Passive, non-blocking, rate-limited health re-probe (Change 2 of the
+ * auto-recover fix). Fires from the `input` hook ONLY while unhealthy and
+ * no more often than once every `HEALTH_PROBE_RATE_LIMIT_MS`. On a 200 from
+ * `/health`, clears the unhealthy flag and resets recall state so the next
+ * recall can fire fresh. NOT gated by healthGate — its purpose is to be the
+ * recovery path under healthGate=block, where recall itself is blocked.
+ *
+ * Intentionally swallows all errors: this is an opportunistic probe, not a
+ * health check the caller cares about. Returns the action it took for tests.
+ */
+export const HEALTH_PROBE_RATE_LIMIT_MS = 10_000;
+export const HEALTH_PROBE_TIMEOUT_MS = 1500;
+
+export async function healthProbe(
+  apiUrl: string,
+  onCleared: () => void,
+  now: () => number = Date.now,
+  fetchImpl: typeof fetch = fetch,
+): Promise<"skipped-healthy" | "skipped-ratelimit" | "cleared" | "still-unhealthy"> {
+  if (healthState.healthy) return "skipped-healthy";
+  const t = now();
+  if (t - lastHealthProbeAt < HEALTH_PROBE_RATE_LIMIT_MS) return "skipped-ratelimit";
+  lastHealthProbeAt = t;
+  try {
+    const res = await fetchImpl(`${apiUrl}/health`, { signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS) });
+    if (res.ok) {
+      log(`health-probe: hindsight reachable — clearing unhealthy state (was: ${healthState.reason})`);
+      markHealthy();
+      onCleared();
+      return "cleared";
+    }
+    log(`health-probe: HTTP ${res.status} — staying unhealthy`);
+    return "still-unhealthy";
+  } catch (e) {
+    log(`health-probe: error ${e} — staying unhealthy`);
+    return "still-unhealthy";
+  }
+}
+
 /**
  * Per-call recall with retry + circuit-breaker for a single bank.
  * Exported for direct unit testing.
@@ -1196,11 +1251,28 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
   pi.on("input", async (event) => {
     currentPrompt = event.input ?? event.text ?? currentPrompt;
+    // Passive auto-recovery (Change 2): if a prior turn marked unhealthy,
+    // try a cheap GET /health every HEALTH_PROBE_RATE_LIMIT_MS. Fire-and-forget
+    // so it never blocks user input. Not gated by healthGate — this is the
+    // recovery path under healthGate=block where recall itself is suppressed.
+    if (!healthState.healthy) {
+      const cfg = resolveConfig(process.cwd());
+      if (cfg?.api_url) {
+        void healthProbe(cfg.api_url, resetRecallState).catch(() => {});
+      }
+    }
   });
 
   // ─── Session lifecycle ─────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    // Change 3: session_start clears unhealthy AND recall state — makes a
+    // fresh session equivalent to /hindsight reset. If the underlying problem
+    // is real (hindsight still down), the next recall/retain will re-mark
+    // unhealthy within one turn; we are not hiding genuine failures, only
+    // clearing stale module-state from a transient blip that already passed.
+    markHealthy();
+    lastHealthProbeAt = 0;
     resetRecallState();
     hookStats.sessionStart = { firedAt: new Date().toISOString(), result: "ok" };
     hookStats.recall = {};
@@ -1802,6 +1874,14 @@ export default function hindsightExtension(pi: ExtensionAPI) {
         .map(r => r.value);
       const ok = fulfilled.map(v => v.bank);
       hookStats.retain = { firedAt: new Date().toISOString(), result: ok.length ? "ok" : "failed", detail: ok.join(", ") };
+
+      // Change 1a: clear unhealthy on any successful retain POST. Symmetric
+      // with the post-recall markHealthy() above. Without this, a transient
+      // unreachable mark only clears on the next successful recall, which may
+      // not fire for hundreds of turns in a long session. Note this fires on
+      // the synchronous 200 — the async watcher below confirms units actually
+      // appeared; the watcher fires its own markHealthy() on real delta.
+      if (ok.length > 0) markHealthy();
 
       // ─── Phase D: background polling for silent failures ─────────────
       // Dispatched BEFORE pi.sendMessage so a stale-ctx throw from sendMessage
