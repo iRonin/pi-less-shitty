@@ -823,10 +823,11 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Agent done sound
-  pi.on("agent_end", async (_event, _ctx) => {
-    agentDoneSound();
-  });
+  // Agent done sound — REMOVED.
+  // Was firing on EVERY LLM turn completion, not just async subagent finishes.
+  // The sound is now played directly in oh-pi's notify.ts on subagent:complete,
+  // so it only fires when a background task actually finishes.
+  // (kept import for agentDoneSound in case other modules need it)
 
   // Inject safety guidelines into system prompt
   pi.on("before_agent_start", async (event, _ctx) => {

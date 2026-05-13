@@ -191,10 +191,10 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   });
 
-  // Agent done sound
-  pi.on("agent_end", async (_event, _ctx) => {
-    agentDoneSound();
-  });
+  // Agent done sound — REMOVED.
+  // Was firing on EVERY LLM turn completion (duplicated with index.ts).
+  // Sound is now played directly in oh-pi's notify.ts on subagent:complete.
+  // (kept import for agentDoneSound in case other modules need it)
 
   // Notify on session start
   pi.on("session_start", async (_event, ctx) => {
