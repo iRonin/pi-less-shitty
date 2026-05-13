@@ -19,9 +19,14 @@ import { test, describe, mock } from "node:test";
 import assert from "node:assert/strict";
 
 // Empirical threshold mirrored from index.ts. Below this, a zero-extraction
-// outcome is treated as legitimate (trivial input). At/above, it's a likely
-// LLM-extraction failure and we surface an alert.
-const SUBSTANTIAL_TRANSCRIPT_CHARS = 500;
+// outcome is treated as legitimate (trivial input). At/above, it's surfaced
+// as either an informational legit-empty or a warning real-LLM-down depending
+// on the operation's error_message field.
+//
+// Bumped 500 → 2000 after gpt-oss-120b on Cerebras started extracting 0 facts
+// from short-but-real inputs as a normal completion. See production constant
+// + comment in ../index.ts.
+const SUBSTANTIAL_TRANSCRIPT_CHARS = 2000;
 
 // ---------------------------------------------------------------------------
 // Polling primitives — kept algorithmically identical to index.ts
@@ -96,12 +101,18 @@ async function pollOperationUntilTerminal(
 type LogEntry = string;
 type SentMessage = { customType: string; details: any };
 type StatusUpdate = { status: string };
+type MarkUnhealthyCall = { reason: string };
 
 async function watchRetainOperation(
   fetchImpl: typeof fetch, apiUrl: string, apiKey: string, bank: string,
   operationId: string, t0: number, snapshot: RetainSnapshot,
   pollIntervalMs: number, maxAttempts: number,
-  hooks: { log: (s: string) => void; sendMessage: (m: SentMessage) => void; setStatus: (s: string) => void },
+  hooks: {
+    log: (s: string) => void;
+    sendMessage: (m: SentMessage) => void;
+    setStatus: (s: string) => void;
+    markUnhealthy?: (reason: string) => void;
+  },
 ): Promise<void> {
   const op = await pollOperationUntilTerminal(fetchImpl, apiUrl, apiKey, bank, operationId, pollIntervalMs, maxAttempts);
   const op_age_ms = Date.now() - t0;
@@ -140,14 +151,21 @@ async function watchRetainOperation(
   const substantial = snapshot.transcriptLen >= SUBSTANTIAL_TRANSCRIPT_CHARS;
 
   if (delta <= 0 && substantial) {
-    hooks.log(`retain-poll: zero-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen}`);
-    hooks.setStatus("⚠ 0 units extracted");
+    // Mirror production: legit-empty iff op.error_message is null/empty.
+    // markUnhealthy is suppressed on legit-empty so a normal 0-fact response
+    // does not block subsequent turns under healthGate=block.
+    const legitEmpty = !op.error_message;
+    hooks.log(`retain-poll: zero-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen} legit_empty=${legitEmpty}`);
+    hooks.setStatus(legitEmpty ? "ℹ 0 facts extracted" : "⚠ 0 units extracted");
+    if (!legitEmpty) hooks.markUnhealthy?.("zero units extracted");
     hooks.sendMessage({
       customType: "hindsight-retain-zero-units-extracted",
       details: {
         bank, operation_id: operationId, op_age_ms, document_id: docId,
         pre_units_count: snapshot.preUnitsCount, post_units_count: postUnits,
         transcript_len: snapshot.transcriptLen,
+        error_message: op.error_message ?? null,
+        legit_empty: legitEmpty,
       },
     });
     return;
@@ -184,12 +202,14 @@ function makeHooks() {
   const logs: LogEntry[] = [];
   const sent: SentMessage[] = [];
   const statuses: StatusUpdate[] = [];
+  const unhealthy: MarkUnhealthyCall[] = [];
   return {
-    logs, sent, statuses,
+    logs, sent, statuses, unhealthy,
     hooks: {
       log: (s: string) => { logs.push(s); },
       sendMessage: (m: SentMessage) => { sent.push(m); },
       setStatus: (s: string) => { statuses.push({ status: s }); },
+      markUnhealthy: (reason: string) => { unhealthy.push({ reason }); },
     },
   };
 }
@@ -268,7 +288,9 @@ describe("retain-polling: zero-units-extracted detection", () => {
     assert.equal(sent[0].details.document_id, "session-test");
     assert.ok(typeof sent[0].details.op_age_ms === "number" && sent[0].details.op_age_ms >= 5000);
     assert.equal(statuses.length, 1);
-    assert.equal(statuses[0].status, "⚠ 0 units extracted");
+    // Op has no error_message → legit-empty path under the Phase D false-positive
+    // fix. Status reflects the informational tone; the message still fires.
+    assert.equal(statuses[0].status, "ℹ 0 facts extracted");
   });
 
   test("substantial transcript + post == pre (append produced nothing): fires alert", async () => {
@@ -287,7 +309,7 @@ describe("retain-polling: zero-units-extracted detection", () => {
     assert.equal(sent[0].customType, "hindsight-retain-zero-units-extracted");
   });
 
-  test("transcript exactly at threshold (500 chars) + zero delta: fires alert", async () => {
+  test("transcript exactly at threshold (2000 chars) + zero delta: fires alert", async () => {
     const op: OperationStatusResponse = {
       operation_id: "op", status: "completed",
       result_metadata: { document_ids: ["session-test"] },
@@ -298,8 +320,195 @@ describe("retain-polling: zero-units-extracted detection", () => {
     ]);
     const { hooks, sent } = makeHooks();
     await watchRetainOperation(fetchImpl, "http://x", "key", "bank", "op", Date.now(),
-      SNAP({ preUnitsCount: 0, transcriptLen: 500 }), 1, 10, hooks);
+      SNAP({ preUnitsCount: 0, transcriptLen: 2000 }), 1, 10, hooks);
     assert.equal(sent.length, 1, "exactly at the threshold should fire");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TESTS — Phase D false-positive fix: legit-empty vs real-LLM-down branching.
+//
+// After switching to a strict extraction model (gpt-oss-120b on Cerebras),
+// the operation status response started looking like:
+//
+//   { status: "completed", error_message: null }   — LLM ran fine, 0 facts
+//
+// for short-but-real inputs. The old gate treated ANY substantial-input +
+// zero-delta as "LLM is down" and surfaced a misleading warning. The fix:
+//
+//   error_message: null      → legit-empty   → INFORMATIONAL message, no
+//                                              markUnhealthy (do NOT block
+//                                              subsequent turns)
+//   error_message: non-null  → real-down     → WARNING message + markUnhealthy
+//                                              (preserves prior behavior for
+//                                              the genuine bug pattern)
+//
+// The schedule-pin test on SUBSTANTIAL_TRANSCRIPT_CHARS=2000 is the
+// anti-regression sentinel: anyone silently reverting to 500 will fail it.
+// ---------------------------------------------------------------------------
+
+describe("retain-polling: legit-empty vs real-LLM-down branching", () => {
+  test("legit-empty: error_message null + delta 0 + substantial → legit_empty=true, NO markUnhealthy", async () => {
+    const op: OperationStatusResponse = {
+      operation_id: "op-legit", status: "completed", error_message: null,
+      result_metadata: { document_ids: ["session-test"] },
+    };
+    const { fetchImpl } = makeFetchSequence([
+      () => jsonResponse(op),
+      () => jsonResponse({ id: "session-test", memory_unit_count: 0 }),
+    ]);
+    const { hooks, sent, statuses, unhealthy } = makeHooks();
+    await watchRetainOperation(fetchImpl, "http://x", "key", "bank", "op-legit", Date.now() - 1500,
+      SNAP({ preUnitsCount: 0, transcriptLen: 2500 }), 1, 10, hooks);
+
+    // WHY: a normal LLM completion with 0 facts must not block subsequent
+    // turns. markUnhealthy under healthGate=block would abort the next turn
+    // with "Hindsight blocked" — the production regression we're preventing.
+    assert.equal(unhealthy.length, 0, "markUnhealthy MUST NOT fire on legit-empty");
+
+    // WHY: the renderer branches on details.legit_empty to pick the info
+    // glyph + neutral copy. Without this field, the user sees the old
+    // misleading "LLM is down" warning.
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].customType, "hindsight-retain-zero-units-extracted");
+    assert.equal(sent[0].details.legit_empty, true);
+    assert.equal(sent[0].details.error_message, null);
+
+    // WHY: status glyph must match the renderer's tone so the inline status
+    // bar matches the message body.
+    assert.equal(statuses[0].status, "ℹ 0 facts extracted");
+  });
+
+  test("real-LLM-down: error_message non-null + delta 0 + substantial → legit_empty=false, markUnhealthy IS called", async () => {
+    const op: OperationStatusResponse = {
+      operation_id: "op-down", status: "completed",
+      error_message: "Connection refused",
+      result_metadata: { document_ids: ["session-test"] },
+    };
+    const { fetchImpl } = makeFetchSequence([
+      () => jsonResponse(op),
+      () => jsonResponse({ id: "session-test", memory_unit_count: 0 }),
+    ]);
+    const { hooks, sent, statuses, unhealthy } = makeHooks();
+    await watchRetainOperation(fetchImpl, "http://x", "key", "bank", "op-down", Date.now() - 4000,
+      SNAP({ preUnitsCount: 0, transcriptLen: 3000 }), 1, 10, hooks);
+
+    // WHY: this is the genuine bug pattern — LLM surfaced an error, the
+    // health-gate behavior must remain unchanged (don't regress the existing
+    // protection by accidentally suppressing markUnhealthy on real failures).
+    assert.equal(unhealthy.length, 1, "markUnhealthy MUST fire when error_message is non-null");
+    assert.equal(unhealthy[0].reason, "zero units extracted");
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].customType, "hindsight-retain-zero-units-extracted");
+    assert.equal(sent[0].details.legit_empty, false);
+    assert.equal(sent[0].details.error_message, "Connection refused");
+    assert.equal(statuses[0].status, "⚠ 0 units extracted");
+  });
+
+  test("below new threshold (1500 chars) + zero delta + null error_message → NO warning fires at all", async () => {
+    const op: OperationStatusResponse = {
+      operation_id: "op-tiny", status: "completed", error_message: null,
+      result_metadata: { document_ids: ["session-test"] },
+    };
+    const { fetchImpl } = makeFetchSequence([
+      () => jsonResponse(op),
+      () => jsonResponse({ id: "session-test", memory_unit_count: 0 }),
+    ]);
+    const { hooks, sent, statuses, unhealthy, logs } = makeHooks();
+    await watchRetainOperation(fetchImpl, "http://x", "key", "bank", "op-tiny", Date.now(),
+      SNAP({ preUnitsCount: 0, transcriptLen: 1500 }), 1, 10, hooks);
+
+    // WHY: 1500 chars used to fire under the old 500 threshold. After bump,
+    // it falls into the legit-zero silent path — no message, no status, no
+    // markUnhealthy. The whole gate is suppressed below threshold.
+    assert.equal(sent.length, 0, "below 2000 threshold must not surface any message");
+    assert.equal(statuses.length, 0);
+    assert.equal(unhealthy.length, 0);
+    assert.ok(logs.some(l => l.includes("legit-zero")), "silent path logs legit-zero");
+  });
+
+  test("at-threshold boundary (2000 chars): both legit-empty and real-down branches fire correctly", async () => {
+    // legit-empty at exactly 2000 chars
+    {
+      const op: OperationStatusResponse = {
+        operation_id: "op-2k-legit", status: "completed", error_message: null,
+        result_metadata: { document_ids: ["session-test"] },
+      };
+      const { fetchImpl } = makeFetchSequence([
+        () => jsonResponse(op),
+        () => jsonResponse({ id: "session-test", memory_unit_count: 0 }),
+      ]);
+      const { hooks, sent, unhealthy } = makeHooks();
+      await watchRetainOperation(fetchImpl, "http://x", "key", "bank", "op-2k-legit", Date.now(),
+        SNAP({ preUnitsCount: 0, transcriptLen: 2000 }), 1, 10, hooks);
+      assert.equal(sent.length, 1, "boundary inclusive: fires at exactly 2000");
+      assert.equal(sent[0].details.legit_empty, true);
+      assert.equal(unhealthy.length, 0);
+    }
+    // real-LLM-down at exactly 2000 chars
+    {
+      const op: OperationStatusResponse = {
+        operation_id: "op-2k-down", status: "completed",
+        error_message: "upstream timeout",
+        result_metadata: { document_ids: ["session-test"] },
+      };
+      const { fetchImpl } = makeFetchSequence([
+        () => jsonResponse(op),
+        () => jsonResponse({ id: "session-test", memory_unit_count: 0 }),
+      ]);
+      const { hooks, sent, unhealthy } = makeHooks();
+      await watchRetainOperation(fetchImpl, "http://x", "key", "bank", "op-2k-down", Date.now(),
+        SNAP({ preUnitsCount: 0, transcriptLen: 2000 }), 1, 10, hooks);
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].details.legit_empty, false);
+      assert.equal(sent[0].details.error_message, "upstream timeout");
+      assert.equal(unhealthy.length, 1);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TESTS — schedule pin (anti-regression for the threshold bump).
+//
+// The constant is exported from index.ts so we can read it directly; the
+// comment-existence check is a source-scan guard so a future refactor can't
+// silently drop the rationale for the bump.
+// ---------------------------------------------------------------------------
+
+describe("retain-polling: SUBSTANTIAL_TRANSCRIPT_CHARS schedule pin", () => {
+  test("production constant is exactly 2000 (anti-regression)", async () => {
+    // Import lazily so this file still runs under environments where the
+    // full extension cannot be imported (e.g. missing peer deps). The pin
+    // value is what we care about — not the full module load.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(join(here, "..", "index.ts"), "utf-8");
+    const m = src.match(/export const SUBSTANTIAL_TRANSCRIPT_CHARS\s*=\s*(\d+)\s*;/);
+    assert.ok(m, "SUBSTANTIAL_TRANSCRIPT_CHARS export not found");
+    assert.equal(
+      Number(m![1]),
+      2000,
+      "threshold must stay at 2000 — see comment block above the constant for rationale (gpt-oss-120b on Cerebras false-positive fix)",
+    );
+  });
+
+  test("production constant carries a rationale comment explaining the bump", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(join(here, "..", "index.ts"), "utf-8");
+    // Locate the comment block immediately preceding the export.
+    const idx = src.indexOf("export const SUBSTANTIAL_TRANSCRIPT_CHARS");
+    assert.ok(idx > 0);
+    const preamble = src.slice(Math.max(0, idx - 1200), idx);
+    // The rationale must mention BOTH the old value and the new value so a
+    // future bumper sees the history without git-blame.
+    assert.match(preamble, /500\s*→\s*2000|Bumped from 500/, "comment must show 500→2000 bump");
+    // And the empirical justification — strict extraction models legitimately
+    // produce 0 facts on short input.
+    assert.match(
+      preamble,
+      /strict extraction|gpt-oss|extractable claim/i,
+      "comment must explain WHY (strict extraction model / extractable claims)",
+    );
   });
 });
 
@@ -325,7 +534,7 @@ describe("retain-polling: legitimate zero extraction (false-positive guard)", ()
     assert.ok(logs.some(l => l.includes("legit-zero")));
   });
 
-  test("trivial transcript (499 chars, just below threshold) + zero delta: STAYS SILENT", async () => {
+  test("trivial transcript (1999 chars, just below threshold) + zero delta: STAYS SILENT", async () => {
     const op: OperationStatusResponse = {
       operation_id: "op", status: "completed",
       result_metadata: { document_ids: ["session-test"] },
@@ -336,7 +545,7 @@ describe("retain-polling: legitimate zero extraction (false-positive guard)", ()
     ]);
     const { hooks, sent } = makeHooks();
     await watchRetainOperation(fetchImpl, "http://x", "key", "bank", "op", Date.now(),
-      SNAP({ preUnitsCount: 0, transcriptLen: 499 }), 1, 10, hooks);
+      SNAP({ preUnitsCount: 0, transcriptLen: 1999 }), 1, 10, hooks);
     assert.equal(sent.length, 0);
   });
 

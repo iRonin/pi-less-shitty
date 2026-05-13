@@ -311,13 +311,20 @@ function shouldSkipRetain(prompt: string | null): { skip: boolean; reason?: stri
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_ATTEMPTS = 24; // 5s * 24 = 120s
 // Empirical threshold for "this transcript was substantive enough that the LLM
-// should have extracted at least one fact". Picked to undershoot rather than
-// over-alert: real-world session retains observed at 14316/19395/25000+ chars
-// produce 14/37/74 units respectively, so anything ≥ 500 chars that yields 0
-// units is a strong signal of extraction failure. Inputs below 500 chars
-// commonly include trivial acks, status checks, single-sentence questions —
-// genuine zero-extraction outcomes for those are silent.
-export const SUBSTANTIAL_TRANSCRIPT_CHARS = 500;
+// should have extracted at least one fact". Picked to UNDER-alert rather than
+// over-alert: real-world session retains at 14316/19395/25000+ chars produce
+// 14/37/74 units respectively, so anything ≥ 2000 chars that yields 0 units
+// is a strong signal of extraction failure.
+//
+// Bumped from 500 → 2000 after switching to gpt-oss-120b on Cerebras. Empirical
+// observation: 500–1500-char retains regularly extract 0 facts because the
+// content genuinely lacks extractable claims (status checks, short replies,
+// single-paragraph notes). Strict extraction models produce many such 0-fact
+// completions, and a 500-char floor was generating false "LLM is down"
+// warnings. >2000 chars of text with ZERO extractable claim is rare, so the
+// new threshold keeps the gate sensitive to real silent failures while
+// dropping the noisy false positives.
+export const SUBSTANTIAL_TRANSCRIPT_CHARS = 2000;
 
 interface OperationStatusResponse {
   operation_id: string;
@@ -513,13 +520,25 @@ async function watchRetainOperation(
     const substantial = snapshot.transcriptLen >= SUBSTANTIAL_TRANSCRIPT_CHARS;
 
     if (delta <= 0 && substantial) {
-      log(`retain-poll: zero-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen}`);
-      try { ctx.ui.setStatus?.("hindsight", "⚠ 0 units extracted"); } catch {}
+      // Two sub-paths inside the same gate:
+      //   legit-empty: status=completed AND error_message is null — the LLM
+      //               responded normally but extracted 0 claims. Informational,
+      //               not actionable; common with strict extraction models.
+      //   real-down:  error_message is non-null — the operation surfaced an
+      //               error even though it ended up in `completed` state
+      //               (rare but the only structural signal we have for an
+      //               unhealthy LLM at the zero-units detection point).
+      const legitEmpty = !op.error_message;
+      log(`retain-poll: zero-units op=${operationId} bank=${bank} age_ms=${op_age_ms} doc=${docId} pre=${snapshot.preUnitsCount} post=${postUnits} transcript_len=${snapshot.transcriptLen} legit_empty=${legitEmpty}`);
+      try { ctx.ui.setStatus?.("hindsight", legitEmpty ? "ℹ 0 facts extracted" : "⚠ 0 units extracted"); } catch {}
       try {
         const settings = loadSettings();
-        if (settings.healthGate !== "off") markUnhealthy("zero units extracted");
-        // Self-heal G1 — opt-in enqueue. Reads settings FRESH so a mid-session
-        // toggle off via `/hindsight self-heal off` is observed immediately.
+        // Suppress markUnhealthy on legit-empty: a normal LLM response with
+        // 0 facts must NOT block subsequent turns under healthGate=block.
+        if (!legitEmpty && settings.healthGate !== "off") markUnhealthy("zero units extracted");
+        // Self-heal G1 — opt-in enqueue. Still runs on legit-empty: the queue's
+        // drain re-POSTs later, and if the next attempt produces facts the
+        // entry self-clears; if not, the awaiting-user alert eventually fires.
         const payload = buildSelfHealEnqueuePayload(bank, snapshot, settings.selfHeal.enabled, retainCtx);
         if (payload) {
           try {
@@ -543,6 +562,8 @@ async function watchRetainOperation(
             pre_units_count: snapshot.preUnitsCount,
             post_units_count: postUnits,
             transcript_len: snapshot.transcriptLen,
+            error_message: op.error_message ?? null,
+            legit_empty: legitEmpty,
           },
         },
         { deliverAs: "nextTurn" },
@@ -1271,13 +1292,27 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
   pi.registerMessageRenderer("hindsight-retain-zero-units-extracted", (msg, _opt, theme) => {
     const d = (msg.details as any) ?? {};
-    let t = theme.fg("warning", "⚠ Hindsight");
-    t += theme.fg("muted", " retain completed but added 0 units");
+    // legit_empty true  → LLM responded normally with 0 facts. Informational.
+    // legit_empty false → operation surfaced error_message → likely LLM-down.
+    const legitEmpty = d.legit_empty === true;
+    // theme.fg color choice: pi-tui's ThemeColor enum has no "info" entry, so
+    // we use "accent" — the canonical neutral highlight color used elsewhere
+    // in this renderer (e.g. /hindsight retry callouts) — to visually distinguish
+    // legit-empty (informational) from real-down (warning).
+    let t = legitEmpty
+      ? theme.fg("accent", "ℹ Hindsight") + theme.fg("muted", ": 0 facts extracted")
+      : theme.fg("warning", "⚠ Hindsight") + theme.fg("muted", " retain completed but added 0 units");
     if (d.bank) t += theme.fg("dim", ` → ${d.bank}`);
     if (typeof d.op_age_ms === "number") t += theme.fg("dim", ` (${Math.round(d.op_age_ms / 1000)}s)`);
     if (typeof d.transcript_len === "number") t += theme.fg("dim", ` [${d.transcript_len} chars in]`);
-    t += "\n" + theme.fg("dim", "  Substantial input → 0 facts extracted suggests the extraction LLM is down.");
-    t += "\n" + theme.fg("dim", "  Check `docker logs hindsight --tail 50` and `~/Work/llm-mode.sh status`.");
+    if (legitEmpty) {
+      t += "\n" + theme.fg("dim", "  LLM responded normally — content may simply lack extractable claims.");
+      t += "\n" + theme.fg("dim", "  No action needed unless this persists across substantive retains.");
+    } else {
+      t += "\n" + theme.fg("dim", "  Substantial input + LLM error → extraction LLM may be unhealthy.");
+      t += "\n" + theme.fg("dim", "  Check `docker logs hindsight --tail 50` and `~/Work/llm-mode.sh status`.");
+      if (d.error_message) t += "\n" + theme.fg("dim", `  ${String(d.error_message).slice(0, 300)}`);
+    }
     return new Text(t, 0, 0);
   });
 
