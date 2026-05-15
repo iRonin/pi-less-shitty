@@ -1,0 +1,26 @@
+{
+  "name": "@ironin/pi-cascading-system-md",
+  "version": "1.0.0",
+  "description": "Walk ancestor directories for .pi/SYSTEM.md. Patches pi's resource-loader so a SYSTEM.md at any ancestor of cwd is found (first-match-wins), with agentDir as final fallback. Fixes the legal-specialist-prompt-invisible-from-subfolders bug.",
+  "license": "MIT",
+  "author": "CK @ iRonin.IT",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": ["src/"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "cascade",
+    "system-prompt"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

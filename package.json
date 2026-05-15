@@ -17,6 +17,7 @@
     "extensions": [
       "packages/cascading-skills/src/cascading-skills.ts",
       "packages/cascading-append-system/src/index.ts",
+      "packages/cascade-system-md/src/index.ts",
       "packages/clear-on-double-esc/src/index.ts",
       "packages/kilocode-model-fix/src/kilocode-model-fix.ts",
       "packages/git-permissions/src/index.ts",
