@@ -9,9 +9,21 @@ Persistent memory for Pi sessions. Memories survive compaction and session resta
 
 ## How It Works
 
-- **Auto-recall**: Before each turn, relevant memories injected from project + global banks
+- **Auto-recall**: Fires on EVERY user prompt by default (bounded by a 5s anti-thrash cooldown). Relevant memories are injected from project + global banks via a `<hindsight_memories>` block. You may also call `hindsight_recall(query)` explicitly when a tool result reveals an unknown or when the auto-injected memories don't cover the current sub-task.
 - **Auto-retain**: After each turn, conversation saved to project bank (delta-only)
 - **Manual tools**: `hindsight_recall`, `hindsight_retain`, `hindsight_reflect`, `hindsight_promote`
+
+### Recall policy (`~/.hindsight/config.toml`)
+
+```toml
+recall_policy = "every-turn"   # every-turn | topic-shift | session-only
+```
+
+| Mode | Behavior |
+|---|---|
+| `every-turn` (DEFAULT) | Fire on every user turn, bounded by a 5s anti-thrash cooldown |
+| `topic-shift` | Fire on first turn + on jaccard / N-turn fallback / trigger phrases (Phase F heuristic) |
+| `session-only` | Fire only on the first turn of a session (legacy) |
 
 ## When to Use Tools
 

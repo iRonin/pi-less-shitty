@@ -59,11 +59,16 @@ import {
   jaccardSimilarity,
   shouldRecall,
   normalizeHeuristic,
+  normalizeRecallPolicy,
+  shouldFireEveryTurn,
   TOPIC_SHIFT_TRIGGER_RE,
   DEFAULT_TOPIC_SHIFT_SETTINGS,
+  DEFAULT_RECALL_POLICY,
+  EVERY_TURN_COOLDOWN_MS,
 } from "./heuristic.ts";
 import type {
   TopicShiftHeuristic,
+  RecallPolicy,
   ShouldRecallInput,
   ShouldRecallDecision,
 } from "./heuristic.ts";
@@ -72,13 +77,18 @@ export {
   jaccardSimilarity,
   shouldRecall,
   normalizeHeuristic,
+  normalizeRecallPolicy,
+  shouldFireEveryTurn,
   TOPIC_SHIFT_TRIGGER_RE,
   DEFAULT_TOPIC_SHIFT_SETTINGS,
+  DEFAULT_RECALL_POLICY,
+  EVERY_TURN_COOLDOWN_MS,
 };
 // TopicShiftRecallSettings is re-exported via `export type { ... }` further
 // down (after HindsightSettings, which embeds it).
 export type {
   TopicShiftHeuristic,
+  RecallPolicy,
   ShouldRecallInput,
   ShouldRecallDecision,
 };
@@ -1034,6 +1044,15 @@ export type SelfHealConfig = _SelfHealConfig;
 
 export interface HindsightSettings {
   healthGate: HealthGate;
+  /**
+   * High-level switch for HOW OFTEN auto-recall fires.
+   *   `every-turn`   — fire on every user turn (5s anti-thrash cooldown). DEFAULT.
+   *   `topic-shift`  — Phase F: jaccard / N-turn / trigger phrases.
+   *   `session-only` — legacy: fire only on the first turn of a session.
+   * When `every-turn` or `session-only` is active, `topicShiftRecall` is ignored
+   * for the decision (still honored by `/hindsight refresh` etc.).
+   */
+  recallPolicy: RecallPolicy;
   recallRetry: { attempts: number; backoffMs: number };
   recallTimeoutMs: number;
   topicShiftRecall: TopicShiftRecallSettings;
@@ -1043,6 +1062,11 @@ export type { TopicShiftRecallSettings };
 
 export const DEFAULT_SETTINGS: HindsightSettings = {
   healthGate: "warn",
+  // Default flipped from topic-shift to every-turn so recall fires on every
+  // user prompt (matches user expectation — "it was working like that").
+  // Cost: ~1 extra hindsight query per turn (100-300ms, no LLM call) and
+  // ~10-15 memories injected via <hindsight_memories> per turn.
+  recallPolicy: DEFAULT_RECALL_POLICY,
   recallRetry: { attempts: 3, backoffMs: 1000 },
   recallTimeoutMs: 5000,
   topicShiftRecall: {
@@ -1091,6 +1115,7 @@ export function buildSettings(
 ): HindsightSettings {
   const base: HindsightSettings = {
     healthGate: DEFAULT_SETTINGS.healthGate,
+    recallPolicy: DEFAULT_SETTINGS.recallPolicy,
     recallRetry: { ...DEFAULT_SETTINGS.recallRetry },
     recallTimeoutMs: DEFAULT_SETTINGS.recallTimeoutMs,
     topicShiftRecall: { ...DEFAULT_SETTINGS.topicShiftRecall },
@@ -1098,6 +1123,7 @@ export function buildSettings(
   };
   if (jsonOverride) {
     if (jsonOverride.healthGate !== undefined) base.healthGate = normalizeHealthGate(jsonOverride.healthGate);
+    if (jsonOverride.recallPolicy !== undefined) base.recallPolicy = normalizeRecallPolicy(jsonOverride.recallPolicy);
     if (jsonOverride.recallRetry) {
       base.recallRetry.attempts = clampInt(jsonOverride.recallRetry.attempts, 1, 10, base.recallRetry.attempts);
       base.recallRetry.backoffMs = clampInt(jsonOverride.recallRetry.backoffMs, 0, 60_000, base.recallRetry.backoffMs);
@@ -1121,6 +1147,7 @@ export function buildSettings(
   }
   if (tomlOverride) {
     if (tomlOverride.health_gate !== undefined) base.healthGate = normalizeHealthGate(tomlOverride.health_gate);
+    if (tomlOverride.recall_policy !== undefined) base.recallPolicy = normalizeRecallPolicy(tomlOverride.recall_policy);
     if (tomlOverride.recall_retry_attempts !== undefined) {
       base.recallRetry.attempts = clampInt(tomlOverride.recall_retry_attempts, 1, 10, base.recallRetry.attempts);
     }
@@ -1545,7 +1572,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
     label: "Hindsight Recall",
     description:
       "Query the persistent memory bank for past decisions, conventions, bug fixes, or domain knowledge that may not be in the current context. " +
-      "Auto-recall fires on the first user turn and re-fires on detected topic shifts (jaccard < threshold, N-turn fallback, or trigger phrases), bounded by a cooldown. Call this tool explicitly when you need targeted context mid-turn or after a tool result reveals an unknown. " +
+      "Auto-recall fires on EVERY user turn by default (bounded by a 5s anti-thrash cooldown). Configurable via `recall_policy` in ~/.hindsight/config.toml (every-turn | topic-shift | session-only). Call this tool explicitly when you need targeted context mid-turn or after a tool result reveals an unknown. " +
       "USE THIS TOOL when: (1) the user references past decisions/conventions/work you don't recall, (2) the auto-injected memories are insufficient for the current sub-task, (3) you would otherwise say 'I don't know' or guess about project-specific facts. " +
       "Cheap (<2s, ~few hundred tokens) — prefer over guessing. Do NOT spam: skip when the auto-injection already answers the question.",
     parameters: Type.Object({
@@ -1735,24 +1762,45 @@ export default function hindsightExtension(pi: ExtensionAPI) {
 
     const settings = loadSettings();
 
-    // ─── Phase F: topic-shift decision ────────────────────
+    // ─── Recall-policy decision ───────────────────────────
+    // Three modes (see HindsightSettings.recallPolicy):
+    //   every-turn   — fire every turn (5s anti-thrash cooldown). DEFAULT.
+    //   topic-shift  — Phase F heuristic (jaccard / N-turn / triggers).
+    //   session-only — fire only on the first turn of a session.
     // Use event.prompt (provided by pi for this exact turn) as the freshest
     // signal; fall back to the session-tracked currentPrompt otherwise.
     const heuristicPrompt = (event as any)?.prompt || currentPrompt || "";
-    const decision = shouldRecall({
-      currentPrompt: heuristicPrompt,
-      lastRecallPrompt,
-      lastRecallAt,
-      turnsSinceLastRecall,
-      now: Date.now(),
-      settings: settings.topicShiftRecall,
-    });
+    const now = Date.now();
+    let decision: ShouldRecallDecision;
+    if (settings.recallPolicy === "every-turn") {
+      if (shouldFireEveryTurn(now, lastRecallAt)) {
+        decision = { fire: true, reason: "every-turn" };
+      } else {
+        const remaining = Math.ceil((EVERY_TURN_COOLDOWN_MS - (now - lastRecallAt)) / 1000);
+        decision = { fire: false, reason: "every-turn-cooldown", detail: `${remaining}s remaining` };
+      }
+    } else if (settings.recallPolicy === "session-only") {
+      decision = lastRecallAt === 0
+        ? { fire: true, reason: "first-turn" }
+        : { fire: false, reason: "session-only" };
+    } else {
+      // topic-shift — Phase F heuristic.
+      decision = shouldRecall({
+        currentPrompt: heuristicPrompt,
+        lastRecallPrompt,
+        lastRecallAt,
+        turnsSinceLastRecall,
+        now,
+        settings: settings.topicShiftRecall,
+      });
+    }
     if (!decision.fire) {
-      log(`recall: skip (${decision.reason}${decision.detail ? ` ${decision.detail}` : ""})`);
+      log(`recall: skip (policy=${settings.recallPolicy}, ${decision.reason}${decision.detail ? ` ${decision.detail}` : ""})`);
       return;
     }
-    log(`recall: fire (${decision.reason}${decision.detail ? ` ${decision.detail}` : ""}, turn ${turnsSinceLastRecall})`);
-    // Each "fire" decision opens a fresh retry window.
+    log(`recall: fire (policy=${settings.recallPolicy}, ${decision.reason}${decision.detail ? ` ${decision.detail}` : ""}, turn ${turnsSinceLastRecall})`);
+    // Each "fire" decision opens a fresh retry window — critical for
+    // `every-turn` so we never hit MAX_RECALL_ATTEMPTS across many turns.
     recallAttempts = 0;
 
     // ─── Health Gate (block mode) ────────────────────
@@ -2208,6 +2256,7 @@ export default function hindsightExtension(pi: ExtensionAPI) {
           "",
           `Settings (~/.pi/agent/hindsight.json):`,
           `  healthGate:        ${s.healthGate}`,
+          `  recallPolicy:      ${s.recallPolicy}`,
           `  recallRetry:       attempts=${s.recallRetry.attempts}, backoffMs=${s.recallRetry.backoffMs}`,
           `  recallTimeoutMs:   ${s.recallTimeoutMs}`,
           `  topicShiftRecall:  enabled=${ts.enabled}, heuristic=${ts.heuristic}, cooldown=${ts.cooldownSeconds}s, everyN=${ts.everyNTurns}, jaccard<${ts.jaccardThreshold}`,

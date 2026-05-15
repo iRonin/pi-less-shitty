@@ -149,3 +149,41 @@ export function shouldRecall(input: ShouldRecallInput): ShouldRecallDecision {
 export function normalizeHeuristic(v: unknown): TopicShiftHeuristic {
   return v === "hybrid" || v === "jaccard" || v === "off" ? v : DEFAULT_TOPIC_SHIFT_SETTINGS.heuristic;
 }
+
+// ---------------------------------------------------------------------------
+// Recall policy — high-level switch for HOW OFTEN auto-recall fires.
+//
+//   every-turn    fire on every user turn, bounded by a 5s anti-thrash cooldown
+//                 (DEFAULT — matches user expectation: "recall after each prompt")
+//   topic-shift   Phase F behavior: jaccard / N-turn / trigger phrases, bounded
+//                 by topicShiftRecall.cooldownSeconds
+//   session-only  legacy pre-Phase-F: fire ONLY on the first user turn of a
+//                 session, never re-fire
+// ---------------------------------------------------------------------------
+
+export type RecallPolicy = "every-turn" | "topic-shift" | "session-only";
+
+export const DEFAULT_RECALL_POLICY: RecallPolicy = "every-turn";
+
+/** 5s anti-thrash cooldown for `every-turn` mode — guards against Enter-spam. */
+export const EVERY_TURN_COOLDOWN_MS = 5_000;
+
+export function normalizeRecallPolicy(v: unknown): RecallPolicy {
+  return v === "every-turn" || v === "topic-shift" || v === "session-only"
+    ? v
+    : DEFAULT_RECALL_POLICY;
+}
+
+/**
+ * `every-turn` cooldown gate. Fires immediately on the first turn
+ * (lastRecallAt === 0), then every `cooldownMs` thereafter.
+ * Pure, deterministic, dependency-free — safe to unit-test directly.
+ */
+export function shouldFireEveryTurn(
+  now: number,
+  lastRecallAt: number,
+  cooldownMs: number = EVERY_TURN_COOLDOWN_MS,
+): boolean {
+  if (lastRecallAt === 0) return true;
+  return now - lastRecallAt >= cooldownMs;
+}
