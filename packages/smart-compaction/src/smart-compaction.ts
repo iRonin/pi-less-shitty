@@ -495,8 +495,12 @@ async function resolveCompactionModel(settings: SmartCompactionSettings, ctx: an
       }
     }
     console.error(`[smart-compaction] model resolution: L1 NOT FOUND, available models with qwen: ${avail.filter(m => m.id.includes('qwen')).map(m => m.id).join(', ') || 'none'}`);
+    // Explicitly configured model not found — fail immediately.
+    // Do NOT silently fall through to the session model (caused a bug
+    // where offline kilocode → silent fallback to anthropic → auth error).
+    return null;
   }
-  // Layer 2: session model (ctx.model or currentModel)
+  // No explicit compactionModel configured — fall back to session model.
   let model = ctx.model ?? modelRegistry.currentModel;
   if (model) {
     console.error(`[smart-compaction] model resolution: L2 session model → ${model.provider}/${model.id} (api=${model.api}, reasoning=${model.reasoning})`);
@@ -513,8 +517,8 @@ async function resolveCompactionModel(settings: SmartCompactionSettings, ctx: an
     }
   }
   // Layer 4: first available with auth
-  const avail = modelRegistry.getAvailable?.() ?? [];
-  for (const m of avail) {
+  const avail2 = modelRegistry.getAvailable?.() ?? [];
+  for (const m of avail2) {
     try {
       const a = await modelRegistry.getApiKeyAndHeaders?.(m);
       if (a?.ok && a?.apiKey) {
@@ -523,7 +527,8 @@ async function resolveCompactionModel(settings: SmartCompactionSettings, ctx: an
       }
     } catch {}
   }
-  throw new Error("Smart compaction: no model available for summarization.");
+  console.error("[smart-compaction] model resolution: NO MODEL AVAILABLE");
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,9 +605,14 @@ async function handleSmartCompaction(
   }));
 
   // Resolve the model to use for summarization
-  let model = await resolveCompactionModel(settings, ctx, ctx.modelRegistry);
+  const model = await resolveCompactionModel(settings, ctx, ctx.modelRegistry);
+  if (!model) {
+    const msg = `Smart compaction: configured model "${settings.compactionModel}" (provider: ${settings.scoringProvider}) could not be resolved. The compaction model must be registered and authenticated — falling back to the session model is intentionally disabled to prevent silent use of the wrong provider.`;
+    console.error(`[smart-compaction] ${msg}`);
+    throw new Error(msg);
+  }
   const summaryModelId = `${model.provider}/${model.id}`;
-
+  // `let` — reassigned below to append split-turn note when isSplitTurn.
   let summary = await generateSmartSummary(
     scoredFlat, loops, signal, ctx.modelRegistry, model, settings, ctx,
     previousSummary, customInstructions, readFiles, modifiedFiles,
@@ -634,7 +644,7 @@ async function handleSmartCompaction(
     tokensSavedEstimate: tokensSaved,
     actualKeepThreshold: settings.keepThreshold,
     actualDropThreshold: settings.dropThreshold,
-    llmUsed: !!summary,
+    llmUsed: true,
     scoringMethod,
     summaryModel: summaryModelId,
   };
