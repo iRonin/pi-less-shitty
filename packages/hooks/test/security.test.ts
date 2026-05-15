@@ -13,7 +13,7 @@
  *   7.  isTrashInstalled exit-status check + absolute-path resolution
  *   8.  addRule atomic write + refusal to clobber malformed configs
  *   9.  Hard blocks re-run on Pass 2 after rewrite
- *   10. rewriteRmToTrash preserves original chain operators
+ *   10. rm -> trash rewrite shell-quoting of paths with spaces
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +25,8 @@ import {
   hardBlockMatch,
   joinChain,
   splitChainedCommands,
+  _rewriteRmToTrash,
+  _shellQuote,
 } from "../src/index.js";
 import {
   _resetNowForTests,
@@ -556,5 +558,77 @@ describe("addRule — bug 8 atomic + refuse to clobber", () => {
     expect(fs.existsSync(stalePath)).toBe(false);
     const cfg = JSON.parse(fs.readFileSync(hooksFilePath(tmp), "utf-8"));
     expect(cfg.rules).toEqual([{ action: "allow", command: "git status" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug 10 — shellQuote in rm → trash rewrite (paths with spaces)
+// ---------------------------------------------------------------------------
+
+describe("shellQuote", () => {
+  it("passes simple args through unquoted", () => {
+    expect(_shellQuote("file.txt")).toBe("file.txt");
+    expect(_shellQuote("/tmp/foo")).toBe("/tmp/foo");
+  });
+
+  it("single-quotes args with spaces", () => {
+    expect(_shellQuote("Legal Tools")).toBe("'Legal Tools'");
+    expect(_shellQuote("my file.txt")).toBe("'my file.txt'");
+  });
+
+  it("escapes embedded single quotes", () => {
+    expect(_shellQuote("it's")).toBe("'it'\\''s'");
+  });
+
+  it("handles tilde prefix with spaces", () => {
+    expect(_shellQuote("~/Work/Legal Tools")).toBe("~'/Work/Legal Tools'");
+  });
+
+  it("quotes dollar signs and backticks", () => {
+    expect(_shellQuote("$HOME")).toBe("'$HOME'");
+    expect(_shellQuote("`whoami`")).toBe("'`whoami`'");
+  });
+
+  it("handles empty string", () => {
+    expect(_shellQuote("")).toBe("''");
+  });
+});
+
+describe("rewriteRmToTrash — shell quoting (bug 10)", () => {
+  it("rewrites rm with escaped-space path, preserving quoting", () => {
+    const result = _rewriteRmToTrash("rm ~/Work/Legal\\ Tools/file.txt");
+    expect(result).not.toBeNull();
+    expect(result).toContain("trash");
+    // The path must not be split into two separate words
+    expect(result).toMatch(/trash.*~'\/Work\/Legal Tools\/file\.txt'/);
+  });
+
+  it("rewrites rm with multiple targets including spaces", () => {
+    const result = _rewriteRmToTrash("rm -rf file.txt ~/Work/Legal\\ Tools/");
+    expect(result).not.toBeNull();
+    expect(result).toMatch(/trash.*-rf.*file\.txt.*~'\/Work\/Legal Tools\/'/);
+  });
+
+  it("does not rewrite rm for /tmp targets", () => {
+    expect(_rewriteRmToTrash("rm /tmp/foo")).toBeNull();
+    expect(_rewriteRmToTrash("rm -rf /tmp/bar /tmp/baz")).toBeNull();
+  });
+
+  it("rewrites when mixed /tmp and non-/tmp targets", () => {
+    const result = _rewriteRmToTrash("rm /tmp/foo ~/Work/bar");
+    expect(result).not.toBeNull();
+    expect(result).toContain("trash");
+  });
+
+  it("does not match rm inside bash -c", () => {
+    expect(_rewriteRmToTrash('bash -c "rm /etc/passwd"')).toBeNull();
+  });
+
+  it("passes through simple rm without quoting", () => {
+    const result = _rewriteRmToTrash("rm ~/Work/somefile.txt");
+    // No spaces in the path — no quoting needed
+    expect(result).not.toBeNull();
+    expect(result).toContain("trash");
+    expect(result).not.toContain("'");
   });
 });

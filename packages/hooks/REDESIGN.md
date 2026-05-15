@@ -133,3 +133,77 @@ Append to system prompt (via `before_agent_start`):
 | `attentionSound()` / `agentDoneSound()` | **Keep** — for notify_user |
 | `promptingFor` concurrency guard | **Keep** — if notify_user needs it |
 | `safety-hooks.ts` | **Merge into index.ts** — single file |
+
+---
+
+# V3 Addendum — Tiered hard-blocks, HOOKS-POLICY.md cascade, LLM judge
+
+Extends V2 with:
+
+## Hard-block tiers
+
+```
+Tier 1 — UNCONDITIONAL. Never overridable.
+   sudo · dd/mkfs/diskutil · > /dev/sd*|disk*|hd*|nvme*|mmcblk*
+   SQL DROP/TRUNCATE · kill -1 · pipe-to-shell · dynamic-substitution
+Tier 2 — PROJECT-OVERRIDABLE via .pi-hooks.json allow rule.
+   git checkout/restore/reset/clean/rebase
+   git push --force / --force-with-lease / --delete
+   git branch -D · git stash drop/clear · git commit --amend · git tag -d
+Tier 3 — LLM-JUDGEABLE.
+   kill <pid> · pkill <target> · killall <target>
+```
+
+Bash precheck order: session allowlist → Tier 1 → `.pi-hooks.json` allow
+(bypasses Tier 2 + Tier 3) → Tier 2 → Tier 3 (judge) → `.pi-hooks.json`
+deny → context analysis.
+
+## Cascading `HOOKS-POLICY.md`
+
+Walks from cwd up to `$HOME` collecting any `HOOKS-POLICY.md` files
+(per-file ≤16 KiB, aggregate ≤32 KiB, symlink-loop safe). The
+concatenated markdown is:
+
+- appended to the agent's system prompt at `before_agent_start`
+- passed to the LLM judge for every Tier-3 verdict
+
+Pure context. Never weakens Tier-1 invariants.
+
+## LLM judge
+
+Config: `~/.pi/agent/llm-judge.json` (default OFF). When enabled,
+Tier-3 commands route through a local OpenAI-compatible endpoint
+(LMStudio default, configurable fallback for Cerebras etc.) which
+returns `{verdict, reason}` ∈ `{allow, confirm, block}`. **Fail-closed**
+in every error path (timeout, network, parse, rate-limit) → `confirm`,
+i.e. existing notify_user flow.
+
+Audit log: `~/.pi/agent/llm-judge.log` (JSONL).
+
+Sample config:
+
+```json
+{
+  "enabled": true,
+  "endpoint": "http://localhost:1234/v1",
+  "model": "qwen/qwen3.6-35b-a3b-mlx",
+  "apiKey": "lm-studio",
+  "timeoutMs": 3000,
+  "maxCallsPerMinute": 20,
+  "fallback": {
+    "endpoint": "https://api.cerebras.ai/v1",
+    "model": "gpt-oss-120b",
+    "apiKey": "csk-..."
+  }
+}
+```
+
+> The fallback's `apiKey` is read verbatim. Paste the literal key.
+
+## notify_user `alwaysPattern`
+
+`notify_user` now accepts an optional `alwaysPattern` (anchored JS
+regex). When the user picks **Always**, the regex is persisted in
+`.pi-hooks.json` instead of the exact command literal — fixing the bug
+where parameterised commands (`kill 9850` vs `kill 12345`) showed the
+dialog every time. Agents must propose tight patterns; never `.*`.

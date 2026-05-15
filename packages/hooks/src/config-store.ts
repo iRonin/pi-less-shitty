@@ -202,7 +202,26 @@ function migrateOldFormat(oldPath: string): LoadedRule[] | null {
  * function THROWS rather than overwriting it — silently clobbering a
  * user's configured rules is unacceptable.
  */
-export function addRule(dir: string, action: HookAction, command: string): boolean {
+export function addRule(
+  dir: string,
+  action: HookAction,
+  commandOrPattern: string,
+  opts: { kind?: "command" | "pattern"; note?: string } = {},
+): boolean {
+  const kind = opts.kind ?? "command";
+
+  // Validate pattern rules at write time so we never persist a regex that
+  // would later throw on load. A bad pattern silently dropped at load time
+  // would be a fail-open: user thinks they have a rule, hooks ignore it.
+  if (kind === "pattern") {
+    try {
+      // eslint-disable-next-line no-new
+      new RegExp(commandOrPattern);
+    } catch (err) {
+      throw new Error(`[pi-hooks] invalid regex pattern: ${(err as Error).message}`);
+    }
+  }
+
   const jsonPath = hooksFilePath(dir);
 
   // Ensure directory exists
@@ -230,14 +249,18 @@ export function addRule(dir: string, action: HookAction, command: string): boole
     }
   }
 
-  // Deduplicate: skip if identical rule already exists
+  // Deduplicate: skip if identical rule already exists (same kind + value).
   for (const existing of config.rules) {
-    if (existing.action === action && existing.command === command) {
-      return false; // already exists
-    }
+    if (existing.action !== action) continue;
+    if (kind === "pattern" && existing.pattern === commandOrPattern) return false;
+    if (kind === "command" && existing.command === commandOrPattern) return false;
   }
 
-  config.rules.push({ action, command });
+  const newRule: HookRule = kind === "pattern"
+    ? { action, pattern: commandOrPattern }
+    : { action, command: commandOrPattern };
+  if (opts.note) newRule.note = opts.note;
+  config.rules.push(newRule);
   const data = JSON.stringify(config, null, 2) + "\n";
 
   // Atomic write: write to ${path}.tmp, fsync, rename.

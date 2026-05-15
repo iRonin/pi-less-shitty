@@ -32,6 +32,10 @@ import {
   type HookAction,
   type LoadedRule,
 } from "./config-store.js";
+import { loadPolicyCascade } from "./policy-loader.js";
+import { judgeCommand } from "./llm-judge.js";
+import { loadJudgeConfig, type JudgeConfig } from "./judge-config.js";
+import { clearJudgeContext, getJudgeContext, recordBashCommand, recordUserPrompt } from "./judge-context.js";
 
 // ============================================================================
 // notify_user tool registration
@@ -51,11 +55,16 @@ function registerNotifyUser(pi: ExtensionAPI): void {
       title: Type.String({ description: "Short title, e.g. 'Confirm file deletion'" }),
       description: Type.String({ description: "Human-readable explanation of what will happen and why. Be specific about consequences." }),
       command: Type.Optional(Type.String({ description: "The actual bash command that will be executed. Always include this so the user can see it." })),
-      choices: Type.Optional(Type.Array(Type.String(), { description: 'Available choices. Default: ["Steer", "Approve", "Deny"]' })),
+      alwaysPattern: Type.Optional(Type.String({ description: "OPTIONAL regex (anchored, JS syntax) to persist instead of the exact command when the user picks 'Always'. Use this for parameterised destructive commands so future variants don't reprompt. Example: command='kill 9850', alwaysPattern='^kill\\s+(-\\S+\\s+)*\\d+$'. The regex MUST be defensive — never include `.*` without a strong anchor. If omitted, the exact command string is persisted as a literal." })),
+      choices: Type.Optional(Type.Array(Type.String(), { description: 'Available choices. Default: ["Steer", "Approve", "Always", "Deny"]. "Always" persists an allow rule in the cwd .pi-hooks.json: either alwaysPattern (regex) or the exact command (literal). Future matches bypass confirmation.' })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const opts = params as { title: string; description: string; command?: string; choices?: string[] };
-      const options = opts.choices?.length ? opts.choices : ["Steer", "Approve", "Deny"];
+      const opts = params as { title: string; description: string; command?: string; alwaysPattern?: string; choices?: string[] };
+      // "Always" is only meaningful when there is a concrete command to persist.
+      const defaultChoices = opts.command
+        ? ["Steer", "Approve", "Always", "Deny"]
+        : ["Steer", "Approve", "Deny"];
+      const options = opts.choices?.length ? opts.choices : defaultChoices;
 
       // Build dialog message: description + command if provided
       let message = opts.description;
@@ -89,8 +98,37 @@ function registerNotifyUser(pi: ExtensionAPI): void {
       // `rm -rf /` fragment for any future call. The allowlist entry has a
       // 60s TTL so a single Approve cannot keep bypassing hard-blocks
       // indefinitely — see permission-ui.ts.
-      if ((choice === "Approve") && opts.command) {
+      if ((choice === "Approve" || choice === "Always") && opts.command) {
         addToSessionAllowlist(opts.command);
+      }
+
+      // "Always" → persist an allow rule in the cwd's .pi-hooks.json. If the
+      // caller supplied `alwaysPattern`, persist that regex (covers
+      // parameterised commands like `kill <pid>` where the literal would
+      // never re-match). Otherwise persist the exact command as a literal.
+      // Failure to persist is non-fatal: the command still runs this session
+      // via the 60s allowlist, and the tool result text reports the error.
+      let alwaysPersisted: { path: string; added: boolean; kind: "pattern" | "command"; value: string } | null = null;
+      let alwaysError: string | null = null;
+      if (choice === "Always" && opts.command) {
+        try {
+          const dir = process.cwd();
+          if (opts.alwaysPattern) {
+            const added = addRule(dir, "allow", opts.alwaysPattern, {
+              kind: "pattern",
+              note: `Always: ${opts.title}`,
+            });
+            alwaysPersisted = { path: path.join(dir, ".pi-hooks.json"), added, kind: "pattern", value: opts.alwaysPattern };
+          } else {
+            const added = addRule(dir, "allow", opts.command, {
+              kind: "command",
+              note: `Always: ${opts.title}`,
+            });
+            alwaysPersisted = { path: path.join(dir, ".pi-hooks.json"), added, kind: "command", value: opts.command };
+          }
+        } catch (err) {
+          alwaysError = (err as Error).message;
+        }
       }
 
       // Tool-result text drives the agent's next action. We make Steer
@@ -108,21 +146,98 @@ function registerNotifyUser(pi: ExtensionAPI): void {
           `Acknowledge to the user and stop.`;
       } else if (choice === "Approve") {
         text = `✅ User chose: **Approve** — proceed with the exact approved command without further confirmation.`;
+      } else if (choice === "Always") {
+        if (alwaysError) {
+          text =
+            `✅ User chose: **Always** — proceed with the exact approved command. ` +
+            `⚠️ Could not persist allow rule: ${alwaysError}. The command is still session-approved for 60s.`;
+        } else if (alwaysPersisted) {
+          const verb = alwaysPersisted.added ? "added to" : "already in";
+          const shape = alwaysPersisted.kind === "pattern" ? `pattern /${alwaysPersisted.value}/` : `literal \`${alwaysPersisted.value}\``;
+          text =
+            `✅ User chose: **Always** — proceed with the exact approved command. ` +
+            `Allow rule (${shape}) ${verb} ${alwaysPersisted.path}; future matches bypass confirmation in this project.`;
+        } else {
+          text = `✅ User chose: **Always** — proceed with the exact approved command.`;
+        }
       } else {
         text = `User chose: **${choice}**`;
       }
 
       return {
         content: [{ type: "text" as const, text }],
-        details: { choice },
+        details: { choice, persisted: alwaysPersisted ?? undefined, persistError: alwaysError ?? undefined },
       };
     },
   });
 }
 
 // ============================================================================
-// Hard blocks (never allowed, cannot be overridden)
+// Hard blocks — two tiers.
+//
+// Tier 1 — UNCONDITIONAL. Never overridable by .pi-hooks.json, HOOKS-POLICY.md,
+//          the LLM judge, or any future mechanism short of code changes here.
+//          Things in this tier have no benign reading: sudo, raw disk writes,
+//          SQL DROP/TRUNCATE, kill -1, piping into a shell.
+//
+// Tier 2 — PROJECT-OVERRIDABLE. Default deny, but a project's .pi-hooks.json
+//          may carry an explicit `allow` rule (pattern or literal) that lets
+//          the command through. Used for the destructive git verbs (checkout,
+//          reset, clean, rebase, force-push, branch -D, stash drop/clear,
+//          commit --amend, tag -d) which are genuinely needed in some
+//          workflows and forbidden in others.
+//
+// Classification is by reason-string prefix. All git-verb reasons emitted
+// by checkGitVerb start with "BLOCKED: git ", so we key off that. Anything
+// not matching the Tier-2 predicate is Tier 1.
 // ============================================================================
+
+export type BlockTier = 1 | 2;
+
+/** Classify a reason string from `hardBlockMatch` into a tier. */
+export function blockTier(reason: string): BlockTier {
+  // Git destructive verbs are Tier 2 — project-overridable.
+  if (/^BLOCKED: git /.test(reason)) return 2;
+  // Force-push / remote-delete / commit --amend / tag -d / branch -D all
+  // come from the same checkGitVerb path; they begin with "BLOCKED:".
+  if (/^BLOCKED: (force-pushing|git )/.test(reason)) return 2;
+  return 1;
+}
+
+// ============================================================================
+// Tier 3 routing — LLM judge
+//
+// Tier 3 covers commands that aren't hard-blocked but are noisy & destructive
+// in a parameterised way: `kill <pid>`, `pkill <pattern>`, `killall <name>`.
+// `Always` with an exact-command rule can't help because the parameter
+// changes every time. The judge sees session context and renders a verdict.
+// ============================================================================
+
+/**
+ * Returns a short routing label when `cmd` should be evaluated by the LLM
+ * judge instead of bouncing straight to notify_user. Null = not Tier 3.
+ */
+export function tier3RoutingReason(cmd: string): string | null {
+  const trimmed = cmd.trim();
+  // kill <pid> | kill -SIG <pid> — numeric target.
+  if (/^kill\s+(-\S+\s+)*\d+(\s|$)/.test(trimmed)) return "kill <pid>";
+  // pkill <pattern> | pkill -SIG <pattern>
+  if (/^pkill\s+(-\S+\s+)*\S+/.test(trimmed)) return "pkill <target>";
+  // killall <name>
+  if (/^killall\s+(-\S+\s+)*\S+/.test(trimmed)) return "killall <target>";
+  return null;
+}
+
+// Judge config cache — read $HOME/.pi/agent/llm-judge.json once per session
+// and reuse. Invalidated on session_start.
+let _judgeConfigCache: JudgeConfig | null = null;
+export function getJudgeConfigCached(): JudgeConfig {
+  if (!_judgeConfigCache) _judgeConfigCache = loadJudgeConfig();
+  return _judgeConfigCache;
+}
+export function invalidateJudgeConfigCache(): void {
+  _judgeConfigCache = null;
+}
 
 // Regex layer — fast path. Each pattern still runs against the literal
 // command, but they are now backed up by a tokenised structural analysis
@@ -511,9 +626,34 @@ export function _resetTrashCheckCache(): void {
   trashAbsolutePath = null;
 }
 
+/** Test-only export of shellQuote. */
+export function _shellQuote(arg: string): string {
+  return shellQuote(arg);
+}
+
+/** Test-only export of rewriteRmToTrash. */
+export function _rewriteRmToTrash(command: string): string | null {
+  return rewriteRmToTrash(command);
+}
+
 // ============================================================================
 // Phase 2: rm → trash rewrite
 // ============================================================================
+
+/**
+ * Shell-escape a single argument so it survives as one word when executed.
+ * Uses single-quoting (disables ALL special chars) with ~-prefix handling
+ * so tilde expansion still works.
+ */
+function shellQuote(arg: string): string {
+  if (!arg) return "''";
+  // No special chars — safe to pass through unquoted
+  if (!/[\s'"\\$`!(){}[\];&|<>?*~]/.test(arg)) return arg;
+  // Tilde expansion: ~/foo → ~ + quoted rest
+  if (arg.startsWith("~/")) return "~" + shellQuote(arg.slice(1));
+  // Single-quote everything, escape embedded single quotes as '\''
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
 
 /**
  * If command uses `rm` on files outside /tmp, rewrite to use `trash`.
@@ -537,8 +677,9 @@ function rewriteRmToTrash(command: string): string | null {
 
   // Rewrite: rm [flags] path1 path2 ... → <abs trash> [flags] path1 path2 ...
   // Use the absolute path resolved from `which trash` to avoid PATH-shadowing.
+  // Each argument is shell-quoted so paths with spaces / special chars survive.
   const trashBin = resolveTrashBinary() ?? "trash";
-  return trashBin + " " + args.slice(1).join(" ");
+  return trashBin + " " + args.slice(1).map(shellQuote).join(" ");
 }
 
 // ============================================================================
@@ -684,6 +825,10 @@ export default function (pi: ExtensionAPI) {
     const command = event.input.command;
     if (!command) return undefined;
 
+    // Record into judge context BEFORE we decide. Even blocked commands
+    // illustrate agent intent and help the next judge verdict.
+    recordBashCommand(command);
+
     const projectRoot = findProjectRoot(ctx.cwd);
     const config = findHooksConfig(ctx.cwd);
 
@@ -737,9 +882,29 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
 
-      // Hard blocks next.
+      // Hard blocks next — tiered.
       const hb = hardBlockMatch(cmd);
-      if (hb) return { block: true, reason: `HARD BLOCK: ${hb}` };
+      if (hb) {
+        const tier = blockTier(hb);
+        if (tier === 2 && config) {
+          const perm = checkPermission(cmd, config.rules);
+          if (perm === "allow") {
+            // Project explicitly opted in. Carry on with the rest of the
+            // pipeline (rm rewrite, etc.).
+          } else {
+            return {
+              block: true,
+              reason:
+                `HARD BLOCK (tier 2, project-overridable): ${hb}\n\n` +
+                `To opt-in for this project, add an allow rule to ${config.filePath} ` +
+                `whose pattern matches this command. Tier-1 invariants (sudo, disk ops, ` +
+                `SQL, kill -1, pipe-to-shell) remain non-overridable.`,
+            };
+          }
+        } else {
+          return { block: true, reason: `HARD BLOCK: ${hb}` };
+        }
+      }
 
       // Pipe-to-shell: `... | bash` / `| sh` etc. The right-hand side of a
       // pipe is a fresh shell invocation — treat it as such.
@@ -779,9 +944,26 @@ export default function (pi: ExtensionAPI) {
       if (isSessionAllowed(trimmed)) continue;
 
       const hb = hardBlockMatch(trimmed);
-      if (hb) return { block: true, reason: `HARD BLOCK: ${hb}` };
+      if (hb) {
+        const tier = blockTier(hb);
+        if (tier === 2 && config) {
+          const perm = checkPermission(trimmed, config.rules);
+          if (perm === "allow") continue; // project opt-in bypasses tier-2
+          if (perm === "deny") return { block: true, reason: `.pi-hooks.json: command denied` };
+        }
+        if (tier === 2) {
+          return {
+            block: true,
+            reason:
+              `HARD BLOCK (tier 2, project-overridable): ${hb}\n\n` +
+              `To opt-in for this project, add an allow rule to ${config?.filePath ?? path.join(ctx.cwd, ".pi-hooks.json")} ` +
+              `whose pattern matches this command.`,
+          };
+        }
+        return { block: true, reason: `HARD BLOCK: ${hb}` };
+      }
 
-      // .pi-hooks.json rules → user override
+      // .pi-hooks.json rules → user override (for non-hard-blocked commands)
       if (config) {
         const permission = checkPermission(trimmed, config.rules);
         if (permission === "allow") continue;
@@ -800,8 +982,51 @@ export default function (pi: ExtensionAPI) {
       const isSafeContext = isCommandSafeInContext(trimmed, projectRoot, config);
       if (isSafeContext) continue;
 
-      // Block with analysis for the LLM to review
+      // Block with analysis for the agent to review.
       const analysis = buildAnalysis(trimmed, projectRoot, `Potentially destructive: ${level} risk`);
+
+      // ----- Tier 3: LLM judge for kill/pkill/killall -----
+      // Before bouncing to notify_user, give the local security evaluator a
+      // chance to decide based on cwd + recent agent activity + cascaded
+      // HOOKS-POLICY.md. The judge is FAIL-CLOSED in every error path: it
+      // can only turn "block + notify_user" into "allow" when it has high
+      // confidence; on any failure the existing notify_user flow proceeds.
+      const tier3Reason = tier3RoutingReason(trimmed);
+      if (tier3Reason) {
+        const judgeCfg = getJudgeConfigCached();
+        if (judgeCfg.enabled) {
+          const policyText = (() => {
+            try { return loadPolicyCascade(ctx.cwd).text; } catch { return ""; }
+          })();
+          const sessionCtx = getJudgeContext();
+          const verdict = await judgeCommand(
+            {
+              command: trimmed,
+              cwd: ctx.cwd,
+              policyText,
+              recentCommands: sessionCtx.recentBash,
+              lastUserPrompt: sessionCtx.lastUserPrompt ?? undefined,
+              routingReason: tier3Reason,
+            },
+            judgeCfg,
+          );
+          if (verdict.verdict === "allow") {
+            // Judge cleared it. Bypass the dialog.
+            continue;
+          }
+          if (verdict.verdict === "block") {
+            return {
+              block: true,
+              reason:
+                `HARD BLOCK (LLM judge): ${verdict.reason}\n\n` +
+                `The local security evaluator (${judgeCfg.model}) explicitly rejected this command. ` +
+                `If you believe this is wrong, call notify_user with the command and let the user decide.`,
+            };
+          }
+          // "confirm" → fall through to the existing notify_user-routing block.
+        }
+      }
+
       return {
         block: true,
         reason: formatAnalysisForLLM(analysis),
@@ -811,9 +1036,18 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   });
 
+  // Track user input so the judge has context for verdicts.
+  pi.on("input", async (event) => {
+    const text = (event as { text?: string }).text;
+    if (typeof text === "string") recordUserPrompt(text);
+    return undefined;
+  });
+
   // Reset session allowlist on session start
   pi.on("session_start", async (_event, ctx) => {
     clearSessionAllowlist();
+    clearJudgeContext();
+    invalidateJudgeConfigCache();
     const config = findHooksConfig(ctx.cwd);
     if (config) {
       ctx.ui.notify(
@@ -829,8 +1063,8 @@ export default function (pi: ExtensionAPI) {
   // so it only fires when a background task actually finishes.
   // (kept import for agentDoneSound in case other modules need it)
 
-  // Inject safety guidelines into system prompt
-  pi.on("before_agent_start", async (event, _ctx) => {
+  // Inject safety guidelines + cascading HOOKS-POLICY.md into system prompt.
+  pi.on("before_agent_start", async (event, ctx) => {
     if (!event.systemPrompt) return;
 
     const safetyGuidelines = `\n\n## Command Safety Guidelines
@@ -840,13 +1074,43 @@ export default function (pi: ExtensionAPI) {
 - /tmp, /private/tmp, and ~/Downloads are always safe for writes and deletions
 - If you're unsure whether a command is safe, use the \`notify_user\` tool to confirm — always pass the \`command\` parameter so the user sees what will run
 - Prefer \`kill\` (SIGTERM) over \`kill -9\` (SIGKILL) unless the process is unresponsive
+- For PARAMETERISED destructive commands (e.g. \`kill <pid>\`, \`pkill <pattern>\`) where the literal will not recur, pass \`alwaysPattern\` to notify_user with a tight anchored regex so the user's "Always" choice persists a useful rule. Example: command="kill 9850", alwaysPattern="^kill\\s+(-\\S+\\s+)*\\d+$". Never propose \`.*\`-style catch-alls.
 
 ## notify_user response handling
 - **Approve**: proceed with the EXACT approved command without further confirmation. Do not modify it.
+- **Always**: same as Approve for this run, AND a persistent allow rule is written to the cwd's \`.pi-hooks.json\`. If \`alwaysPattern\` was supplied, the regex is persisted; otherwise the exact command literal. Future matches bypass the dialog in this project.
 - **Steer**: STOP. Do not execute any further tool calls. Reply with ONE short sentence asking the user what to adjust, then wait for their input.
 - **Deny**: abandon the operation entirely. Do not retry, do not work around it.`;
 
     event.systemPrompt += safetyGuidelines;
+
+    // ----------------------------------------------------------------
+    // Cascading HOOKS-POLICY.md context.
+    //
+    // Walk from session cwd up to $HOME, concatenate any HOOKS-POLICY.md
+    // files, and append to the system prompt. This gives the agent (and
+    // later the LLM security judge) project-specific intent without
+    // weakening any hardcoded Tier-1 invariant: the policy text is
+    // advisory context, not enforcement.
+    //
+    // Failures are non-fatal: we never let a malformed/missing policy
+    // block agent start.
+    // ----------------------------------------------------------------
+    try {
+      const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
+      const cascade = loadPolicyCascade(cwd);
+      if (cascade.files.length > 0) {
+        const filesList = cascade.files.map((f) => `  - ${f.path}`).join("\n");
+        event.systemPrompt += `\n\n## Project Hooks Policy\n\nThe following HOOKS-POLICY.md files apply to the current cwd (root → leaf order; closest has the last word). Treat as additional CONTEXT, not as a replacement for the hardcoded safety rules above.\n\nFiles loaded:\n${filesList}\n${cascade.text}`;
+        if (cascade.warnings.length) {
+          // Surface warnings to logs (not the prompt) so the agent isn't
+          // confused by infrastructure noise.
+          for (const w of cascade.warnings) console.warn(`[pi-hooks] ${w}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[pi-hooks] policy cascade load failed:`, (err as Error).message);
+    }
   });
 }
 
